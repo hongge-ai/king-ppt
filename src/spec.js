@@ -4,6 +4,8 @@
 // 预览==导出：浏览器与 .pptx 消费同一份被 sanitize 过的 SVG，故此处只谈「怎么写 SVG」，不再有 8 类版式字段。
 // 由 GET /api/templates/:id/spec 暴露；生成引擎按此契约逐页作画。
 
+const { contractText } = require('./compiler-contract');
+
 const CANVAS = { vbWidth: 1280, vbHeight: 720 };
 
 // 四种页面角色（role）——只是排版意图的提示，不是硬字段；按内容自行判断
@@ -15,18 +17,28 @@ const ROLE_GUIDE = [
 ];
 
 // ---------- 主题令牌 → 人读的设计系统说明 ----------
-function tokensText(theme) {
+// 有 styleModel 时，令牌必须以它为准：template.json 里的色板来自 Office 主题槽位
+// （常是 4F81BD/C0504D 这种默认色），与模板真实用色无关；而本说明又要求模型
+// 「只用这些值」，用错源就等于强制模型画错色。styleModel 的颜色是从参考页实测/观察得到的。
+function tokensText(theme, styleModel) {
   const t = theme.tokens || {};
-  const c = t.color || {};
   const s = t.scale || {};
   const g = t.geometry || {};
   const f = t.font || {};
-  const colorLines = Object.entries(c).map(([k, v]) => `  ${k.padEnd(12)} ${v}`).join('\n');
+  const smColors = (styleModel && styleModel.tokens && Array.isArray(styleModel.tokens.color))
+    ? styleModel.tokens.color.filter((e) => e && typeof e.value === 'string' && /^#[0-9a-fA-F]{6}$/.test(e.value))
+    : [];
+  const colorLines = smColors.length
+    ? smColors.map((e) => `  ${String(e.id || '').padEnd(14)} ${e.value}   ← ${e.role || ''}`).join('\n')
+    : Object.entries(t.color || {}).map(([k, v]) => `  ${k.padEnd(12)} ${v}`).join('\n');
   const scaleLines = Object.entries(s).map(([k, v]) => `  ${k.padEnd(12)} ${v}px`).join('\n');
+  const colorSource = smColors.length
+    ? '（来自模板分析 styleModel：按每条的用途语义使用，不要把强调色铺成大面积底色）'
+    : '（来自模板主题槽位；尚未分析出 styleModel，可能与模板真实用色有出入）';
   return `
 设计令牌（这套主题的调色板与字号，务必只用这些值，保证整册一致）：
 
-配色 color（fill / stroke 只允许取这些十六进制值，可叠加 fill-opacity/stroke-opacity 做层次）：
+配色 color${colorSource}，fill / stroke 只允许取这些十六进制值，可叠加 fill-opacity/stroke-opacity 做层次：
 ${colorLines}
 
 字号 scale（font-size 请就近取这些档位，别随意造字号）：
@@ -42,32 +54,20 @@ ${scaleLines}
 基调 tone：${theme.tone || '简洁专业，大量留白，对齐严谨'}`.trimStart();
 }
 
-// ---------- SVG 创作硬规则（同时决定 sanitize 会保留什么） ----------
-const AUTHORING_RULES = `
-每页输出一个完整 SVG 字符串，规则如下（违反的部分会被服务端清洗掉，可能导致预览与你的预期不符）：
-
-结构：
-- 根元素固定：<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">…</svg>；画布逻辑尺寸恒为 1280×720。
-- 只输出 SVG 本身。作为 JSON 字符串推送时，内部双引号转义为 \\"。
-
-允许的元素：
-- 图形：<rect> <circle> <ellipse> <line> <polyline> <polygon> <path> <text> <g> <image>
-- <g> 仅用于 transform="translate(x,y)"（可选 rotate/scale）分组。
-- <path> 用标准 d 指令（M/L/H/V/C/S/Q/T/A/Z，绝对或相对均可）——会被原生编译为 pptx 自定义几何，保持可编辑。
-- <image> 仅允许内联 data: URI（xlink:href/href="data:image/...;base64,…"）；外链图片会被剔除。先经 POST /api/assets 拿到 base64 再内联。
-- <text> 必须带 x、y、font-size、fill；对齐用 text-anchor="start|middle|end"；**换行 = 多个 <text>，不要用 <tspan>**（tspan 定位在导出端不保证）。
-
-禁止（会被清洗）：
-- <script>、on* 事件属性、javascript: —— 安全。
-- <defs>、<linearGradient>/<radialGradient>、渐变、<filter>、<mask>、<clipPath>、<pattern>、<use>、<symbol> ——
-  导出端（pptxgenjs）无法忠实还原渐变/滤镜/裁剪，为守住「预览==导出」一律禁用。需要层次就用纯色 + fill-opacity 叠色块。
-- <style>、CSS 动画、<animate*>、外部字体/资源（@font-face、外链 href）。
-
-排版自检：
-- 文字元素放在最后（装饰色块/线条在前），确保文字不被遮挡。
-- 文字距画布四边 ≥ margin；正文 font-size 不小于 caption 档位。
-- 严格对齐：同类元素共用 x 基线；成组卡片等距分布。
-- 一页只讲一件事；宁可留白，不要塞满。`.trim();
+// ---------- SVG 创作硬规则：由编译器事实派生，不在此手写（见 src/compiler-contract.js） ----------
+// 历史教训：这里曾手写「<g> 可选 rotate/scale」，而 svg-to-pptx 只解析 translate，
+// 变换被静默丢弃导致预览与导出不一致。能力清单只能有一个来源。
+const AUTHORING_RULES = [
+  '每页输出一个完整 SVG 字符串。违反下列约束的部分会被服务端清洗掉，或导出后与预览不符：',
+  '',
+  contractText(),
+  '',
+  '排版自检：',
+  '- 文字元素放在最后（装饰色块/线条在前），确保文字不被遮挡。',
+  '- 文字距画布四边 ≥ margin；正文 font-size 不小于 caption 档位。',
+  '- 严格对齐：同类元素共用 x 基线；成组卡片等距分布。',
+  '- 一页只讲一件事；宁可留白，不要塞满。',
+].join('\n');
 
 // ---------- 从令牌合成 4 个角色原型页（既作预览缩略，也作生成起手骨架） ----------
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');

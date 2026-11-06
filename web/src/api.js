@@ -22,6 +22,9 @@ export const api = {
   // 上传模板：先提取+烘焙为暂存（base64），再落库为可复用模板；删除用于本地维护
   extractTemplate: (name, data) => req('/api/templates/extract', { method: 'POST', body: { name, data } }),
   saveTemplate: (stagingId, name) => req('/api/templates', { method: 'POST', body: { stagingId, name } }),
+  // 模板分析：逐页渲染证据 + 测量画像 → styleModel（写回 template-profile.json）。
+  // 多模态长任务，上传保存后触发一次，后续生成与验收共用这份规格。
+  analyzeTemplate: (id) => req(`/api/templates/${encodeURIComponent(id)}/analyze`, { method: 'POST', body: {} }),
   deleteTheme: (id) => req(`/api/templates/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   // 演示态快照（刷新/重连恢复）：deck=整册幻灯片，doc=内容大纲
   deck: () => req('/api/deck'),

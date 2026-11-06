@@ -158,7 +158,14 @@
 - `sourceCanvas`：原始尺寸、比例和单位。
 - `targetViewBox`：目标画布。
 - `aspectPolicy`：原比例保留、适配或阻断，以及原因。
-- `tokens`：color、font、scale、geometry；每项明确角色和单位。
+- `tokens`：`color`、`font`、`scale`、`geometry` 四个**数组**，每个元素是一条带证据的令牌，而不是「名称→值」的映射。每条至少包含：
+  - `id`：稳定标识（如 `c-bg`、`c-accent`、`g-radius-card`）；
+  - `role`：这条令牌在版式里的语义位置（如「页面底色」「强调色：编号徽章/图标」「左右安全边距」），用可读语言写清楚，下游按语义归类，不依赖 id 的字面命名；
+  - `color` 条目必须有 `value`（`#RRGGBB`）；
+  - `geometry`、`scale` 条目必须有 `value` 或 `px`，以及 `unit`（`px`、`pt`、`inch` 之一，源文件的 pt/inch 必须保留原单位并在 `sourcePt` 等字段注明换算前数值）；
+  - `font` 条目必须有 `family` 与 `status`（`confirmed` 或 `visual-candidate`）；
+  - 每条都要有 `evidenceType` 与 `confidence`。
+  - 不要把颜色合并成一句「主色是蓝色」；不同用途的同色系（强调色、深强调色）分别成条目。
 - `fingerprints`：风格指纹与负向约束。
 - `families`：角色之下的版式家族和变体。
 - `components`：组件规则。

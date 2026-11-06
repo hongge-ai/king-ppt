@@ -33,12 +33,13 @@ const px = (profile) => 1280 / num(profile?.canvas?.width, 13.333);
 const fontPx = (pt) => Math.max(12, num(pt, 20) * 96 / 72);
 
 // 均衡折行：把文本切成 k 行长度接近的行，而不是「前 k-1 行塞满、尾行剩孤字」。
-// 同时保证：行首不出现收尾标点（，。、；：等挂在上一行行尾）、英文/数字单词不从中间断开、
-// 超出容量时以 … 收尾且每行不超过 maxChars。
-function lines(text, maxChars = 18, maxLines = 2) {
+// 同时保证：行首不出现收尾标点（，。、；：等挂在上一行行尾）、英文/数字单词不从中间断开。
+// 溢出时**不补省略号**：返回 overflow=true，由调用方决定缩字号/换变体/放弃确定性渲染
+// （generate-slide 契约明确禁止用省略号或截断字符串隐藏内容丢失）。
+function wrapText(text, maxChars = 18, maxLines = 2) {
   const raw = String(text || '').replace(/[#>*_`]/g, '').replace(/\s+/g, ' ').trim();
-  if (!raw) return [];
-  if (raw.length <= maxChars) return [raw];
+  if (!raw) return { rows: [], overflow: false };
+  if (raw.length <= maxChars) return { rows: [raw], overflow: false };
   const overflow = raw.length > maxChars * maxLines;
   const src = overflow ? raw.slice(0, maxChars * maxLines) : raw;
   const k = Math.min(maxLines, Math.ceil(src.length / maxChars));
@@ -72,14 +73,18 @@ function lines(text, maxChars = 18, maxLines = 2) {
       out[i] = out[i].slice(0, -1);
     }
   }
-  if (overflow && out.length) out[out.length - 1] = `${out[out.length - 1].slice(0, -1)}…`;
-  return out.filter(Boolean);
+  return { rows: out.filter(Boolean), overflow };
 }
+// 只要行、不关心溢出时的便捷形式（textBlock / 收盘标题行数估算使用）
+function lines(text, maxChars = 18, maxLines = 2) {
+  return wrapText(text, maxChars, maxLines).rows;
+}
+// 正文条目：保留全部内容，不再 slice 上限。条目过多是容量问题，
+// 由调用方的容量检查判定并如实上报，而不是悄悄丢掉第 6 条。
 function bodyItems(section) {
-  const items = String(section?.body || '').split('\n')
+  return String(section?.body || '').split('\n')
     .map((x) => x.replace(/^\s*(?:[-*]|\d+[.)])\s*/, '').trim())
     .filter((x) => x && !x.startsWith('>'));
-  return items.slice(0, 5).map((x) => x.slice(0, 60));
 }
 function leadOf(section) {
   const line = String(section?.body || '').split('\n').find((l) => l.trim().startsWith('>'));
@@ -261,11 +266,20 @@ function footerChrome(profile, { index, total, left, bodyFont, muted }) {
   const pageNo = `${String(index + 1).padStart(2, '0')} / ${String(total || index + 1).padStart(2, '0')}`;
   return rect(profile, bx, footY - 0.22, W - bx * 2, 0.014, { fill: muted, opacity: 0.3 })
     + textLine((W - 0.84) * scale, footY * scale, pageNo, { size: 12.5, fill: muted, family: bodyFont, anchor: 'end' })
-    + (left ? textLine(bx * scale, footY * scale, String(left).slice(0, 34), { size: 12, fill: muted, family: bodyFont }) : '');
+    // 页脚左标签属于 chrome：装不下就整条省略，不把章节名截成半截（截断≠布局）
+    + (left && estTextWpx(String(left), fontPx(12)) <= (W - bx * 2 - 1.7) * scale
+      ? textLine(bx * scale, footY * scale, String(left), { size: 12, fill: muted, family: bodyFont }) : '');
+}
+
+// 容量不足的统一出口：返回 null（本页交回生成端按 styleModel 重新规划），
+// 并把可解释的原因写进 diag.reason —— 绝不靠截断/省略号掩盖内容丢失。
+function capacityFail(diag, reason) {
+  if (diag) { diag.ok = false; diag.reason = reason; }
+  return null;
 }
 
 // ---------- content page: token-driven card system + bottom conclusion ----------
-function renderContent(profile, templateDir, section, index, total, imageData, spec) {
+function renderContent(profile, templateDir, section, index, total, imageData, plan, diag) {
   const scale = px(profile);
   const W = profile.canvas.width;
   const bg = tok(profile, 'bg', '#0B1120');
@@ -277,13 +291,14 @@ function renderContent(profile, templateDir, section, index, total, imageData, s
   const cardAccents = [accent, accent2]; // blue + amber alternation
   const bodyFontRaw = profile.invariants.fonts[1] || profile.invariants.fonts[0] || 'Microsoft YaHei';
   const bodyFont = esc(String(bodyFontRaw).startsWith('+') ? fontFamily(profile, bodyFontRaw) : bodyFontRaw);
-  // 反推规格旋钮：模板禁圆角（如学术规范的「直角无阴影」）则卡片直角；
-  // 禁阴影/渐变本渲染器默认就不产出，无需处理。
-  const forbidden = JSON.stringify((spec && spec.generalization && spec.generalization.forbidden) || '');
-  const cardRx = /圆角|胶囊/.test(forbidden) ? 0.004 : 0.06;
-  const iconRx = /圆角|胶囊/.test(forbidden) ? 0.008 : 0.05;
+  // 圆角来自 styleModel 的几何令牌（用户单位 px → 英寸）。模板若声明「直角/无圆角」，
+  // 分析阶段会给出极小值；缺失时才用卡片默认值。不再对散文做关键词嗅探。
+  const geo = (profile.tokens && profile.tokens.geometry) || {};
+  const rxPx = Number(geo.cornerRadius);
+  const cardRx = Number.isFinite(rxPx) ? Math.max(0, rxPx) / scale : 0.06;
+  const iconRx = Math.max(cardRx, 0.004);
   // 说明文字用中性深灰（ink 向 bg 混 34%）：muted 是品牌色（藏青/橙）的模板，
-  // 卡片正文不能整段带色——规格的强调色纪律「蓝色仅用于标题、节点和结构块」
+  // 卡片正文不能整段带色——强调色纪律「强调色仅用于标题、节点和结构块」
   const descFill = mixHex(ink.replace('#', ''), bg.replace('#', ''), 0.34);
 
   const role = profile.roles.content || null; // 无烘焙顶栏（素材包常见）→ 规格化白底版式，而非回落 LLM
@@ -295,31 +310,35 @@ function renderContent(profile, templateDir, section, index, total, imageData, s
   // title on the baked top-bar at a page-title size; keep the measured
   // color/font when present.
   const barH = Number(role && role.hIn) || 1.15;
-  // 反推规格的页标题色（如学术模板的藏青标题），无实测槽位色时优先于全局 ink
-  const specTitleColor = cleanHex(spec && spec.typography && spec.typography.pageTitle && spec.typography.pageTitle.color);
+  // 页标题色：styleModel 的 title 角色色（如学术模板的藏青标题）优先于全局 ink。
+  // 这是结构化令牌，不再从散文里嗅探句式。
+  const titleColor = tok(profile, 'title', null) || ink;
   const titleSlot = {
     rect: [titleX, Math.max(0.24, barH / 2 - 0.36), W - titleX - 0.84, 0.72],
     size: Math.min(Math.max(Number(role && role.slot && role.slot.size) || 26, 20), 30),
-    color: readableOn(bg, (role && role.slot && role.slot.color) || specTitleColor, [ink]), bold: true, align: 'left', font: role && role.slot && role.slot.font,
+    color: readableOn(bg, (role && role.slot && role.slot.color) || titleColor, [ink]), bold: true, align: 'left', font: role && role.slot && role.slot.font,
   };
   const tslot = titleSlot.rect;
   const title = textAtSlot(titleSlot, profile, section.heading, { maxLines: 1, fallbackColor: ink, maxSize: 30 });
-  // 标题装饰线：规格若描述「短粗线接长细线」（学术模板常见），画双段；否则单段 accent
-  const accentLineSpec = String((spec && spec.layoutGrammar && spec.layoutGrammar.accentLines) || '');
-  const underline = /短[\u4e00-\u9fa5]?线.*接.*长|长.*线.*接/.test(accentLineSpec)
-    ? rect(profile, titleX, tslot[1] + tslot[3] + 0.04, 0.9, 0.055, { fill: accent })
-      + rect(profile, titleX + 1.02, tslot[1] + tslot[3] + 0.055, Math.min(3.4, W - titleX - 2), 0.016, { fill: muted, opacity: 0.45 })
-    : rect(profile, titleX, tslot[1] + tslot[3] + 0.04, 1.15, 0.045, { fill: accent });
+  // 标题必须一行放得下；放不下是容量问题，交回生成端，不缩成省略号。
+  const titleMaxChars = Math.max(6, Math.floor(((tslot[2] * scale * 0.98) / (fontPx(titleSlot.size) * 0.92))));
+  if (wrapText(section.heading, titleMaxChars, 1).overflow) {
+    return capacityFail(diag, `页标题过长：${String(section.heading || '').length} 字，本版式一行仅容 ${titleMaxChars} 字`);
+  }
+  const underline = rect(profile, titleX, tslot[1] + tslot[3] + 0.04, 1.15, 0.045, { fill: accent });
 
   const [bx, by, bw] = (role && role.bodyRect) || [0.85, 1.6, W - 1.7, 0];
   const allItems = bodyItems(section);
   // 多行引用（诗/词/口诀）→ 诗文面板模式：诗行整体入面板，不再被截成一句当金句条。
+  // 不再截到 8 行：超出面板容量即交回生成端（诗文页有专属家族，不该被硬塞进卡片版式）。
   const quoteLines = String(section?.body || '').split('\n')
     .filter((l) => /^\s*>/.test(l))
     .map((l) => l.replace(/^\s*>\s*/, '').trim())
-    .filter(Boolean)
-    .slice(0, 8);
+    .filter(Boolean);
   const verse = quoteLines.length >= 3;
+  if (verse && quoteLines.length > 12) {
+    return capacityFail(diag, `引用行 ${quoteLines.length} 行，本版式面板最多容纳 12 行`);
+  }
   // 「标签：」式空说明行（如「诗文：」「齐诵名句：」）不配成卡片——它的内容在引用块里。
   const labeled = allItems.filter((it) => !(!splitPoint(it).desc && /[:：]\s*$/.test(it.trim())));
   const items = labeled.length ? labeled : allItems;
@@ -359,7 +378,12 @@ function renderContent(profile, templateDir, section, index, total, imageData, s
   const bandH = bandBottom - cardTop;
 
   let parts = '';
-  const n = Math.min(Math.max(cards.length, 1), 4);
+  // 卡片版式最多 4 列；超出说明内容形态不适合本家族，交回生成端换家族，
+  // 而不是把第 5 条起的内容丢掉。
+  if (cards.length > 4) {
+    return capacityFail(diag, `条目 ${cards.length} 条，卡片版式最多 4 列`);
+  }
+  const n = Math.max(cards.length, 1);
   if (n === 1 && !conclusion) {
     // Single point with no takeaway → a centered key-message statement.
     const cardH = Math.min(bandH, 2.4);
@@ -458,7 +482,7 @@ function unlabel(s) {
 }
 
 // ---------- cover: full-bleed illustration + three-level title stack ----------
-function renderCover(profile, templateDir, section, imageData, docTitle, spec) {
+function renderCover(profile, templateDir, section, imageData, docTitle, hints) {
   const W = profile.canvas.width; const H = profile.canvas.height;
   const bg = tok(profile, 'bg', '#0B1120');
   const ink = tok(profile, 'ink', '#F1F5F9');
@@ -469,9 +493,9 @@ function renderCover(profile, templateDir, section, imageData, docTitle, spec) {
   const slots = frame?.slots || {};
   const scale = px(profile);
   const title = docTitle || section.heading;
-  // 反推规格的封面文案挑选规则：textGrammar.prefer 列出应进副标题位的标签
+  // 封面文案挑选规则：styleModel 的 textRules.prefer 列出应进副标题位的标签
   // （如学术模板的「答辩人/指导教师/院校」），命中标签的行优先，其余按序补位。
-  const prefer = Array.isArray(spec?.roles?.cover?.textGrammar?.prefer) ? spec.roles.cover.textGrammar.prefer : null;
+  const prefer = (hints && Array.isArray(hints.coverPrefer)) ? hints.coverPrefer : null;
   let sub = '';
   let tagline = '';
   if (prefer && prefer.length) {
@@ -596,7 +620,7 @@ function renderCover(profile, templateDir, section, imageData, docTitle, spec) {
 }
 
 // ---------- section divider: illustration + oversized number + bilingual eyebrow ----------
-function renderSection(profile, templateDir, section, index, total, imageData, docTitle, spec) {
+function renderSection(profile, templateDir, section, index, total, imageData, docTitle, hints) {
   const scale = px(profile);
   const W = profile.canvas.width; const H = profile.canvas.height;
   const bg = tok(profile, 'bg', '#0B1120');
@@ -611,7 +635,7 @@ function renderSection(profile, templateDir, section, index, total, imageData, d
   const chapterTitle = String(section.heading || '').replace(/^第[一二三四五六七八九十百\d]+[章节]\s*[:：]?\s*/, '');
   const cnChapter = section.heading?.match(/^(第[一二三四五六七八九十百\d]+[章节])/)?.[1] || `第 ${no} 章`;
   // 反推规格的编号风格：bilingual（默认）/ cn（只用「第N章」）/ numCn
-  const eyebrowStyle = spec?.layoutGrammar?.numbering || 'bilingual';
+  const eyebrowStyle = (hints && hints.numbering) || 'bilingual';
   const eyebrow = eyebrowStyle === 'cn' ? cnChapter
     : eyebrowStyle === 'numCn' ? `第 ${no} 章 · ${cnChapter}`
       : `CHAPTER ${no} · ${cnChapter}`;
@@ -624,10 +648,9 @@ function renderSection(profile, templateDir, section, index, total, imageData, d
       : rect(profile, 0, 0, W, H, { fill: bg, opacity: 0.42 });
   // 巨大章节序号 = 右下角半透明水印，垫在文字层之下（绘制顺序在 scrim 之后、文字之前）。
   // 不再使用 bake 测得的 sectionNo 槽位——那槽位与左侧文字栈在长标题下必然相撞。
-  // 颜色遵循规格强调色纪律：accentDiscipline 把「章节号」分给 accent2 时用 accent2
+  // 颜色遵循强调色纪律：章节巨字若在 styleModel 里归属第二强调色，则用 accent2
   // （如深色科技模板的橙色章节巨字），否则用 accent。
-  const discipline = JSON.stringify((spec && spec.tokens && spec.tokens.accentDiscipline) || '');
-  const wmColor = /章节/.test(discipline) ? accent2 : accent;
+  const wmColor = (hints && hints.watermarkAccent === 2) ? accent2 : accent;
   const numberEl = textLine((W - 0.62) * scale, (H * 0.78) * scale, no, { size: 170, fill: wmColor, family: fontFamily(profile, '+mj'), bold: true, anchor: 'end', opacity: 0.26 });
 
   const tx = 0.84;
@@ -695,13 +718,22 @@ function renderClosing(profile, templateDir, section, index, imageData, docTitle
     + `</svg>`;
 }
 
-function renderTemplateSlide({ profile, templateDir, section, role, index, total, imageData, docTitle, spec }) {
-  if (role === 'cover') return renderCover(profile, templateDir, section, imageData, docTitle, spec);
-  if (role === 'section') return renderSection(profile, templateDir, section, index, total, imageData, docTitle, spec);
+// 渲染一页。返回 SVG 字符串或 null：
+//   null = 本页不该由确定性渲染器产出（家族未实现 / 内容超出该版式容量），
+//   由调用方记录 diag.reason 后交回 styleModel 约束的生成端重新规划。
+// plan 与 hints 来自 src/page-plan.js；缺失时按旧行为处理（全部走 cards）。
+function renderTemplateSlide({ profile, templateDir, section, role, index, total, imageData, docTitle, plan, hints, diag }) {
+  if (role === 'cover') return renderCover(profile, templateDir, section, imageData, docTitle, hints);
+  if (role === 'section') return renderSection(profile, templateDir, section, index, total, imageData, docTitle, hints);
   if (role === 'closing') return renderClosing(profile, templateDir, section, index, imageData, docTitle);
-  // 内容页：即使没烤出 content 顶栏，也走规格化确定性版式（素材包模板常见），
-  // 绝不回落 LLM 自由渲染——那是「任意模板」崩坏的主要来源。
-  return renderContent(profile, templateDir, section, index, total, imageData, spec);
+  // 正文：只有 pagePlan 判定的家族有确定性实现时才画。未实现的家族（图表/表格/流程…）
+  // 交回生成端按 styleModel 生成——绝不把所有正文压成同一套卡片。
+  const impl = plan ? plan.renderer : 'cards';
+  if (impl === 'cards') {
+    // 即使没烤出 content 顶栏（素材包常见），也走确定性版式，不回落 LLM 自由渲染。
+    return renderContent(profile, templateDir, section, index, total, imageData, plan, diag);
+  }
+  return capacityFail(diag, `家族「${(plan && plan.familyId) || '未识别'}」暂无确定性实现，交由生成端按 styleModel 生成`);
 }
 
-module.exports = { renderTemplateSlide, bodyItems, lines };
+module.exports = { renderTemplateSlide, bodyItems, lines, wrapText };

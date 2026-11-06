@@ -17,7 +17,8 @@ const llmprovider = require('./llmprovider');
 const genOutline = require('./generate-outline');
 const genDeck = require('./generate-deck');
 const { renderTemplateSlide } = require('./template-renderer');
-const reverseSpecMod = require('./reverse-spec');
+const styleModel = require('./style-model');
+const { planDeck, renderHints } = require('./page-plan');
 const { scoreDeck } = require('./style-score');
 
 const app = express();
@@ -56,6 +57,25 @@ function wrap(handler) {
       if (res.headersSent) return res.end(); // 已开始响应（如 sendFile 中途断开），只能放弃
       res.status(statusOf(err)).json({ error: err.message });
     }
+  };
+}
+
+// 参考页图加载器：分析阶段把源模板逐页渲染到 <模板目录>/.ref/page-NN.png，
+// 生成时按 pagePlan.referencePageIndexes 取对应页作为「真实证据」喂给演示模型。
+// 没有分析产物时返回空数组——调用方据此回退到合成原型，并如实标注来源。
+function refPageLoader(dir) {
+  const refDir = path.join(dir, '.ref');
+  const fileFor = (i) => path.join(refDir, `page-${String(i + 1).padStart(2, '0')}.png`);
+  return (pagePlan) => {
+    if (!pagePlan || !Array.isArray(pagePlan.referencePageIndexes)) return [];
+    return pagePlan.referencePageIndexes
+      .filter((i) => fs.existsSync(fileFor(i)))
+      .slice(0, 2)
+      .map((i) => ({
+        n: i + 1,
+        familyId: pagePlan.familyId,
+        dataUri: `data:image/png;base64,${fs.readFileSync(fileFor(i)).toString('base64')}`,
+      }));
   };
 }
 
@@ -170,21 +190,33 @@ app.post('/api/templates/extract', wrap(async (req, res) => {
   res.json(await extractFromPptx(buffer, name || 'uploaded.pptx'));
 }));
 
-// 视觉反推：源模板逐页渲染图 + 机器测量画像 → TEMPLATE_SPEC（视觉语义层规格）。
-// 产物存模板目录 template-spec.json，供生成端（版式语法旋钮）与 QA 端（自检闭环）共用。
-app.post('/api/templates/:id/reverse-spec', wrap(async (req, res) => {
+// 模板分析：逐页渲染证据图 + 机器测量画像 → styleModel（视觉语义层规格），写回
+// template-profile.json，与测量字段并列保存。生成端与验收端共用这一份真值。
+// 分析是一次性的重活（多模态、几十秒），只在上传保存后或显式重建时触发。
+app.post('/api/templates/:id/analyze', wrap(async (req, res) => {
   const d = loadDescriptor(req.params.id);
   const sourcePath = path.join(d._dir, 'source.pptx');
-  if (!fs.existsSync(sourcePath)) return res.status(400).json({ error: '该模板没有 source.pptx 原件，无法反推' });
+  if (!fs.existsSync(sourcePath)) return res.status(400).json({ error: '该模板没有 source.pptx 原件，无法分析' });
   const profile = loadProfile(d._id);
-  const { spec } = await reverseSpecMod.reverseSpec({
+  if (!profile) return res.status(400).json({ error: '该模板缺少机器测量画像（template-profile.json），无法分析' });
+  if (!llmprovider.listActive().vision) {
+    return res.status(400).json({ error: '尚未配置视觉模型：请打开右上角「模型设置」为「识图」能力绑定模型' });
+  }
+  const { model, validation } = await styleModel.analyzeTemplate({
     buffer: fs.readFileSync(sourcePath),
     profile,
-    outDir: path.join(d._dir, '.reverse'),
+    outDir: path.join(d._dir, '.ref'),
     mediaDir: path.join(d._dir, '.media'),
-    specDir: d._dir,
   });
-  res.json({ ok: true, spec });
+  styleModel.saveStyleModel(d._dir, model, validation);
+  res.json({
+    ok: true,
+    schemaVersion: model.schemaVersion,
+    families: (model.families || []).length,
+    components: (model.components || []).length,
+    validation,
+    styleModel: model,
+  });
 }));
 
 app.post('/api/templates', wrap(async (req, res) => {
@@ -376,9 +408,13 @@ app.post('/api/generate/deck', wrap(async (req, res) => {
   const profile = loadProfile(theme.id);
   const { title, sections } = genDeck.splitOutline(md);
   const total = sections.length;
-  const tplSpec = reverseSpecMod.loadTemplateSpec(theme._dir); // 反推规格（存在则驱动版式语法旋钮）
-  // 规格生效的整册画像：令牌校正（视觉判定的 bg/ink + 模板实测主色）
-  const effProfile = tplSpec ? reverseSpecMod.applySpecTokens(profile, tplSpec, theme.palette && theme.palette.primary) : profile;
+  // styleModel：模板的视觉语义层规格（分析阶段产出）。缺失时按纯测量画像走旧行为。
+  const model = profile ? styleModel.loadStyleModel(theme._dir) : null;
+  const hints = renderHints(model);
+  // 令牌统一出口：视觉判定的 bg/ink + 模板实测主色，替代原先分散的 spec 覆盖
+  const effProfile = profile ? { ...profile, tokens: styleModel.resolveTokens(profile, model, theme.palette && theme.palette.primary) } : null;
+  const plan = planDeck({ styleModel: model, sections, profile: effProfile });
+  const refLoader = refPageLoader(theme._dir);
 
   genDeck.acquire();
   try {
@@ -399,12 +435,17 @@ app.post('/api/generate/deck', wrap(async (req, res) => {
       const s = sections[i];
       const profilePolicy = spec.imagePolicy || { enabled: wantImages, roles: ['cover', 'section', 'closing'], size: '1024x1024', prompt: artDirection || profile?.imageStyle };
       const imageData = profile ? await genDeck.generateSlideImage({ role: s.role, index: i, docTitle: title, section: s, policy: profilePolicy, brief: briefs ? briefs[i] : null }) : null;
-      let svg = profile ? renderTemplateSlide({ profile, templateDir: theme._dir, section: s, role: s.role, index: i, total, imageData, docTitle: title, spec: tplSpec }) : null;
+      const pagePlan = plan.pages[i];
+      const diag = {};
+      let svg = effProfile ? renderTemplateSlide({ profile: effProfile, templateDir: theme._dir, section: s, role: s.role, index: i, total, imageData, docTitle: title, plan: pagePlan, hints, diag }) : null;
       if (!svg) {
-        svg = await genDeck.generateSlideSvg({ docTitle: title, section: s, role: s.role, index: i, total, spec });
+        svg = await genDeck.generateSlideSvg({ docTitle: title, section: s, role: s.role, index: i, total, spec, theme, styleModel: model, plan: pagePlan, referenceImages: refLoader(pagePlan) });
         svg = await genDeck.addGeneratedImage(svg, { role: s.role, index: i, docTitle: title, section: s, policy: spec.imagePolicy });
       }
-      const slide = normalize.normalizeSlide({ svg, role: s.role, title: s.heading }, i, total);
+      const slide = normalize.normalizeSlide({
+        svg, role: s.role, title: s.heading,
+        meta: { familyId: pagePlan.familyId, variantId: pagePlan.variantId, evidence: pagePlan.evidence, referencePageIndexes: pagePlan.referencePageIndexes, styleModelVersion: plan.styleModelVersion, ...(diag.reason ? { capacityOverflow: diag.reason } : {}) },
+      }, i, total);
       if (slide._recovered) recovered.push(i);
       relay.setSlide(i, slide, theme.canvas);
     }
@@ -432,6 +473,12 @@ app.post('/api/generate/slide', wrap(async (req, res) => {
   const total = Math.max(sections.length, idx + 1);
   const section = sections[idx];
   if (!section) return res.status(400).json({ error: `大纲中没有第 ${idx + 1} 页对应的内容` });
+  const model = profile ? styleModel.loadStyleModel(theme._dir) : null;
+  const hints = renderHints(model);
+  const effProfile = profile ? { ...profile, tokens: styleModel.resolveTokens(profile, model, theme.palette && theme.palette.primary) } : null;
+  const plan = planDeck({ styleModel: model, sections, profile: effProfile });
+  const pagePlan = plan.pages[idx];
+  const refLoader = refPageLoader(theme._dir);
 
   genDeck.acquire();
   try {
@@ -445,12 +492,22 @@ app.post('/api/generate/slide', wrap(async (req, res) => {
     }
     const profilePolicy = spec.imagePolicy || { enabled: wantImages, roles: ['cover', 'section', 'closing'], size: '1024x1024', prompt: artDirection || profile?.imageStyle };
     const imageData = profile ? await genDeck.generateSlideImage({ role: section.role, index: idx, docTitle: title, section, policy: profilePolicy, brief: briefs ? briefs[idx] : null }) : null;
-    let svg = profile ? renderTemplateSlide({ profile, templateDir: theme._dir, section, role: section.role, index: idx, total, imageData, docTitle: title, spec: reverseSpecMod.loadTemplateSpec(theme._dir) }) : null;
+    // 用户给了修改意见时，确定性渲染器无从理解自然语言：直接把「上一版 SVG + 家族约束 + 意见」
+    // 交给模型做局部修复。没有意见且有确定性实现时，才走稳定渲染。
+    const prevSlide = relay.getState().slides && relay.getState().slides[idx];
+    const previousSvg = feedback && prevSlide && prevSlide.svg ? prevSlide.svg : null;
+    const diag = {};
+    let svg = (!feedback && effProfile)
+      ? renderTemplateSlide({ profile: effProfile, templateDir: theme._dir, section, role: section.role, index: idx, total, imageData, docTitle: title, plan: pagePlan, hints, diag })
+      : null;
     if (!svg) {
-      svg = await genDeck.generateSlideSvg({ docTitle: title, section, role: section.role, index: idx, total, spec, feedback });
+      svg = await genDeck.generateSlideSvg({ docTitle: title, section, role: section.role, index: idx, total, spec, theme, feedback, styleModel: model, plan: pagePlan, referenceImages: refLoader(pagePlan), previousSvg });
       svg = await genDeck.addGeneratedImage(svg, { role: section.role, index: idx, docTitle: title, section, policy: spec.imagePolicy });
     }
-    const slide = normalize.normalizeSlide({ svg, role: section.role, title: section.heading }, idx, total);
+    const slide = normalize.normalizeSlide({
+      svg, role: section.role, title: section.heading,
+      meta: { familyId: pagePlan.familyId, variantId: pagePlan.variantId, evidence: pagePlan.evidence, referencePageIndexes: pagePlan.referencePageIndexes, styleModelVersion: plan.styleModelVersion, ...(diag.reason ? { capacityOverflow: diag.reason } : {}) },
+    }, idx, total);
     relay.setSlide(idx, slide, theme.canvas);
     res.json({ index: idx, recovered: slide._recovered ? [idx] : [], renderer: profile ? 'template-profile' : 'free-svg', styleScore: profile ? scoreDeck({ profile, slides: relay.getState().slides }) : null });
   } finally {

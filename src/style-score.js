@@ -44,7 +44,8 @@ function closestTitle(slide, role = slide.role) {
 function roleScore(slide, role, profile) {
   const target = profile?.roles?.[role];
   if (!target) return 0.6;
-  const expectsBaked = role === 'content' ? Boolean(target.asset) : Boolean(target.asset);
+  // 模板该角色是否带烘焙素材：带了就必须有图（image 维度计分），没带则此项不计缺陷。
+  const expectsBaked = Boolean(target.asset);
   const imageScore = expectsBaked ? (slide.images.length ? 1 : 0) : 1;
   const slot = role === 'content' ? target.slot : (target.slots?.title || target.slots?.quote);
   if (!slot) return imageScore;

@@ -274,4 +274,6 @@ function svgToScene(svgString, canvas) {
   return { background: { color: 'FFFFFF' }, objects };
 }
 
-module.exports = { svgToScene };
+// SHAPE_TAGS 一并导出：src/compiler-contract.js 以它为「允许元素」的唯一事实来源，
+// 避免提示词里的能力清单与编译器实际遍历的标签脱节。
+module.exports = { svgToScene, SHAPE_TAGS };

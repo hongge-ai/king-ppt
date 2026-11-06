@@ -180,6 +180,18 @@ export default function App() {
         const t = (saved.templates || []).find((x) => x.id === saved.id);
         if (t) setPreviewTheme(t);
         flash('模板已上传', 'ok');
+        // 分析模板视觉语义（styleModel）：多模态长任务，失败不阻塞使用——
+        // 没有 styleModel 时生成端按纯测量画像走，只是家族与风格纪律信息更少。
+        flash('正在分析模板风格…', 'ok');
+        try {
+          const an = await api.analyzeTemplate(saved.id);
+          const bad = an && an.validation && an.validation.ok === false;
+          flash(bad
+            ? `模板已分析（${an.families || 0} 个家族，${an.validation.errors.length} 项待确认）`
+            : `模板已分析（${(an && an.families) || 0} 个家族）`, 'ok');
+        } catch (e) {
+          flash(`风格分析未完成：${e.message}（生成仍可用，但缺少家族与风格纪律）`, 'error');
+        }
       } catch (e) {
         flash(`上传失败：${e.message}`, 'error');
       } finally {

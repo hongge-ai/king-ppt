@@ -1,10 +1,12 @@
-// 阶段2：按主题令牌 + 定稿大纲，逐页生成整页 SVG。纯 LLM 逻辑——产出裸 SVG 字符串；
-// 切页、并发锁在此提供，relay 落库与 SSE 推送由 src/server.js 路由做（本模块不碰 relay）。
-// 生成规则不自造：直接复用 buildSpec 产出的 tokensText（令牌）+ authoringText（SVG 硬规则，
-// 即 svg-sanitize 会保留什么）+ 角色原型骨架，喂给模型，与 /spec 暴露的是同一份创作契约。
+// 阶段2：按模板 styleModel + 定稿大纲，逐页生成整页 SVG。
+// 已实现的版式家族由 template-renderer 确定性绘制；未实现的家族才走本模块的模型生成，
+// 且模型必须服从同一份 styleModel 与编译器能力契约——两条路径共享设计依据。
+const path = require('path');
 const llm = require('./llm');
 const { deriveTitle } = require('./normalize-outline');
 const llmprovider = require('./llmprovider');
+const { contractText } = require('./compiler-contract');
+const { tokensText } = require('./spec');
 const assets = require('./assets');
 const htmlShot = require('./html-shot');
 const fs = require('fs');
@@ -227,12 +229,34 @@ async function deckImageBriefs({ docTitle, sections, cacheKey } = {}) {
   return briefs;
 }
 
-// 角色语义（喂给模型，决定版式意图）；与 spec.js 的 ROLE_GUIDE 对齐
-const ROLE_BRIEF = {  cover: '封面页：超大主标题 + 眉题/副标题或署名，一个视觉锚点，大面积主色或留白',
-  section: '章节过渡页：深色底 + 超大章节序号 + 章节名，信息极少',
-  content: '正文页：页标题 + accent 下划线 + 2~5 个要点/卡片/数据，严格对齐、留白充足',
-  closing: '结尾页：致谢/收束，一句话居中安静，可选行动号召',
-};
+// 提示词与能力契约均按需读取并缓存：提示词是版本管理的静态资产（src/prompts/），
+// 能力契约由编译器源码事实生成（src/compiler-contract.js），都不在此处手写。
+const _promptCache = new Map();
+function promptFile(name) {
+  if (!_promptCache.has(name)) {
+    _promptCache.set(name, fs.readFileSync(path.join(__dirname, 'prompts', name), 'utf8'));
+  }
+  return _promptCache.get(name);
+}
+
+// 本页相关的 styleModel 切片：只给该家族、该角色与全局锁定项，避免每页重复整套参考规范。
+function styleSlice(styleModel, plan) {
+  if (!styleModel) return null;
+  const pickFamily = (fams) => (fams || []).filter(Boolean).map((f) => ({
+    ...f,
+    variants: (f.variants || []).filter((v) => !plan || !plan.variantId || v.id === plan.variantId || (f.variants || []).length === 1),
+  }));
+  return {
+    schemaVersion: styleModel.schemaVersion,
+    tokens: styleModel.tokens || null,
+    fingerprints: styleModel.fingerprints || null,
+    families: pickFamily((styleModel.families || []).filter((f) => !plan || !plan.familyId || f.id === plan.familyId)),
+    components: styleModel.components || null,
+    imageStyle: styleModel.imageStyle || null,
+    exportRisks: styleModel.exportRisks || null,
+    unknowns: styleModel.unknowns || null,
+  };
+}
 
 // 确定性切页：# → 文档标题；每个 ## 连同其下正文 = 一页。无状态、同输入同切分，
 // 故单页重画时重切取第 index 段即可，页序稳定可复现。
@@ -263,15 +287,33 @@ function splitOutline(markdown) {
     return short && /^(第[一二三四五六七八九十百\d]+[章节]|[一二三四五六七八九十]+、|0?\d+[.、\s]|chapter\s+\d+)/i.test(h);
   };
   const isClosingHeading = (heading) => /(谢谢|感谢|致谢|结语|结尾|收尾|总结|尾声|结束|行动|倡议|寄语|致敬|takeaway|closing|thank\s*you)/i.test(String(heading || '').trim());
+  const itemCount = (body) => String(body || '').split('\n')
+    .map((x) => x.replace(/^\s*(?:[-*]|\d+[.)])\s*/, '').trim())
+    .filter((x) => x && !x.startsWith('>')).length;
+  // 首个 ## 是否配当封面：只有「薄」的首节（无条目或仅一条）才当封面。
+  // 带 2 条以上条目的首节是正文页——把它当封面，条目会在封面版式里被丢弃，
+  // 而这正是 generate-slide 契约禁止的静默丢内容。这种情况改为补一张合成封面。
+  const firstBody = sections.length ? sections[0].bodyLines.join('\n') : '';
+  const firstIsThin = itemCount(firstBody) <= 1;
   const pages = sections.map((s, i) => {
     const body = s.bodyLines.join('\n').trim();
     // 章节标题优先判 section：带「第N章/一、」编号的页绝不是收尾页（防「第三章：总结与展望」被吞成 closing）
-    const role = total <= 1 ? 'cover'
-      : i === 0 ? 'cover'
-        : isSectionHeading(s.heading, body) ? 'section'
-          : isClosingHeading(s.heading) ? 'closing' : 'content';
+    const role = (total <= 1 || i === 0)
+      ? (firstIsThin ? 'cover' : 'content')
+      : isSectionHeading(s.heading, body) ? 'section'
+        : isClosingHeading(s.heading) ? 'closing' : 'content';
     return { heading: s.heading, body, raw: `## ${s.heading}\n${body}`.trim(), role };
   });
+
+  // 首节是正文页时，用文档标题合成封面，保证整册仍有封面且正文一页不少
+  if (pages.length && !firstIsThin) {
+    pages.unshift({
+      heading: title || '演示文稿',
+      body: '',
+      raw: `# ${title || ''}`.trim(),
+      role: 'cover',
+    });
+  }
 
   // Chapter numbers are semantic, not page indexes. A cover and content pages
   // must never turn a later divider into "04" just because it is page four.
@@ -320,40 +362,73 @@ function splitOutline(markdown) {
   }
   return { title, sections: pages };
 }
-
 // 生成一页 SVG（裸字符串，未归一）。运行期错误（网络/超时）抛给路由；模型未产出 SVG 时
 // 返回 ''——由路由经 normalizeSlide 归一为坏页（BLANK + _recovered），可事后单页重画。
-async function generateSlideSvg({ docTitle, section, role, index, total, spec, feedback }) {
+//
+// 设计依据全部来自 styleModel + pagePlan + compilerContract，不再使用硬编码的角色版式话术：
+//   - 有参考页图时走 chatVision，让模型看着真实模板页画（证据优先于合成原型）；
+//   - 没有参考页时回退到合成原型，并显式标注 source:'synth'，不冒充模板证据。
+async function generateSlideSvg({ docTitle, section, role, index, total, spec, theme, feedback, styleModel, plan, referenceImages, previousSvg }) {
+  const sliced = styleSlice(styleModel, plan);
   const proto = (spec.layouts || []).find((l) => l.role === role);
+  const protoSource = referenceImages && referenceImages.length ? 'reference'
+    : (proto ? (proto.source === 'file' ? 'reference-file' : 'synth') : 'none');
+
+  const styleBlock = sliced
+    ? '## styleModel（本次锁定的风格画像，按家族切片）\n' + JSON.stringify(sliced, null, 1)
+    : '## styleModel\n（本模板尚未分析出 styleModel：按令牌与内容自行判断版式，不要套用通用商务卡片）';
+  const planBlock = plan ? '## pagePlan（本页计划）\n' + JSON.stringify(plan, null, 1) : '';
+  const protoBlock = protoSource === 'reference'
+    ? ''
+    : (proto ? '<prototype source="' + protoSource + '">\n' + proto.svg + '\n</prototype>' : '');
+
   const system = [
-    '你是资深 PPT 版式设计师。依据下面这套主题的设计令牌与创作规则，为「一页」内容创作一整张 SVG。',
+    promptFile('generate-slide.md'),
     '',
-    spec.tokensText,
+    '## 本次画布与设计令牌',
+    // spec.tokensText 构建时还不知道 styleModel；有 styleModel 时必须以它的实测色板重写，
+    // 否则模型会被「只许用这些值」约束到 Office 主题槽位的默认色上。
+    styleModel && theme ? tokensText(theme, styleModel) : spec.tokensText,
     '',
-    spec.authoringText,
+    '## 编译器能力契约',
+    contractText(),
     '',
-    proto ? `该页角色的原型骨架（供参考，可在其基础上替换文字、按内容增删元素）：\n${proto.svg}` : '',
-    '',
-    '输出要求：只输出一整张 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">…</svg>；'
-      + '不要任何解释、不要 Markdown 代码块围栏；严格遵守上面的创作规则（违规元素会被清洗，导致预览异常）。',
+    styleBlock,
+    planBlock,
+    '## 参考原型来源',
+    protoSource === 'reference'
+      ? '附带的参考页图来自本模板的原始页面（由对象图重建渲染）。它们是真实证据，请复刻其家族级设计语言。'
+      : protoSource === 'reference-file'
+        ? '下面的原型 SVG 来自模板自带的 layouts/ 目录，属于模板证据。'
+        : '未找到本家族的参考页；下面的原型是合成回退，只作为起点，不得当作模板的真实证据。',
+    protoBlock,
   ].filter(Boolean).join('\n');
 
   const user = [
-    `演示主标题：${docTitle || '（无）'}`,
-    `本页角色：${ROLE_BRIEF[role] || ROLE_BRIEF.content}（第 ${index + 1} 页 / 共 ${total} 页）`,
+    '演示主标题：' + (docTitle || '（无）'),
+    '本页角色：' + role + '（第 ' + (index + 1) + ' 页 / 共 ' + total + ' 页）',
+    plan && plan.familyId ? '本页家族：' + plan.familyId + (plan.variantId ? ' / ' + plan.variantId : '') : '',
     '',
-    '本页内容（Markdown）：',
+    '本页内容（Markdown，内容不得改动、不得截断、不得用省略号掩盖）：',
     section.raw,
-    feedback ? `\n本页修改意见（请据此重画）：${feedback}` : '',
+    feedback ? '\n本页修改意见（只在必要范围内改动，锁定没有问题的部分）：' + feedback : '',
+    previousSvg ? '\n上一版 SVG（局部修复时以它为基准，不要重做整页）：\n<previous-svg>\n' + previousSvg + '\n</previous-svg>' : '',
     '',
     '请为这一页创作 SVG。',
   ].filter(Boolean).join('\n');
 
-  const text = await llm.chat(
-    [{ role: 'system', content: system }, { role: 'user', content: user }],
-    { temperature: 0.6, maxTokens: 4000 },
-  );
+  const text = await (referenceImages && referenceImages.length
+    ? llm.chatVision([{
+      role: 'user',
+      content: [
+        { type: 'text', text: system + '\n\n' + user },
+        ...referenceImages.flatMap((r, k) => ([
+          { type: 'text', text: '参考页 ' + (r.n || k + 1) + (r.familyId ? '（家族 ' + r.familyId + '）' : '') + '：' },
+          { type: 'image_url', image_url: { url: r.dataUri } },
+        ])),
+      ],
+    }], { temperature: 0.6, maxTokens: 6000, timeoutMs: 300000 })
+    : llm.chat([{ role: 'system', content: system }, { role: 'user', content: user }], { temperature: 0.6, maxTokens: 6000 }));
   return llm.extractSvg(text);
 }
-
 module.exports = { splitOutline, generateSlideSvg, addGeneratedImage, generateSlideImage, deckArtDirection, deckImageBriefs, acquire, release };
