@@ -238,7 +238,8 @@ function resolve(capability) {
 }
 
 // ---------- HTTP 工具（带硬超时） ----------
-async function postJSON(url, { key, body, headers = {} }) {
+// timeoutMs 可按调用覆盖：多模态反推等长任务传更大值（如 300000），其余维持 120s 快速失败
+async function postJSON(url, { key, body, headers = {}, timeoutMs = REQUEST_TIMEOUT_MS }) {
   let resp;
   try {
     resp = await fetch(url, {
@@ -249,7 +250,7 @@ async function postJSON(url, { key, body, headers = {} }) {
         ...headers,
       },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
     if (e.name === 'TimeoutError' || e.name === 'AbortError') throw fail('模型请求超时', 'LLM_TIMEOUT');
@@ -328,11 +329,19 @@ async function probeCandidates(rawBase, fn) {
 
 // ---------- 适配器：OpenAI 兼容 ----------
 const openaiAdapter = {
-  async chat(ctx, messages, { temperature = 0.7, json = false, maxTokens } = {}) {
+  async chat(ctx, messages, { temperature = 0.7, json = false, maxTokens, timeoutMs } = {}) {
     const body = { model: ctx.model, messages, temperature };
     if (json) body.response_format = { type: 'json_object' };
     if (maxTokens) body.max_tokens = maxTokens;
-    const data = await postJSON(`${ctx.baseURL}/chat/completions`, { key: ctx.apiKey, body });
+    let data;
+    try {
+      data = await postJSON(`${ctx.baseURL}/chat/completions`, { key: ctx.apiKey, body, timeoutMs });
+    } catch (e) {
+      // 部分网关（如 Kimi k3）只接受固定 temperature：去掉该参数重试一次
+      if (!/invalid temperature/i.test(String(e && e.message))) throw e;
+      delete body.temperature;
+      data = await postJSON(`${ctx.baseURL}/chat/completions`, { key: ctx.apiKey, body, timeoutMs });
+    }
     const content = data.choices?.[0]?.message?.content;
     if (!content) throw fail('模型返回内容为空', 'LLM_EMPTY');
     return content;

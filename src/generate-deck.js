@@ -262,13 +262,14 @@ function splitOutline(markdown) {
     const short = String(body || '').replace(/\s+/g, '').length <= 65;
     return short && /^(第[一二三四五六七八九十百\d]+[章节]|[一二三四五六七八九十]+、|0?\d+[.、\s]|chapter\s+\d+)/i.test(h);
   };
-  const isClosingHeading = (heading) => /(谢谢|感谢|结语|结尾|收尾|总结|尾声|结束|行动|倡议|寄语|致敬|takeaway|closing|thank\s*you)/i.test(String(heading || '').trim());
+  const isClosingHeading = (heading) => /(谢谢|感谢|致谢|结语|结尾|收尾|总结|尾声|结束|行动|倡议|寄语|致敬|takeaway|closing|thank\s*you)/i.test(String(heading || '').trim());
   const pages = sections.map((s, i) => {
     const body = s.bodyLines.join('\n').trim();
+    // 章节标题优先判 section：带「第N章/一、」编号的页绝不是收尾页（防「第三章：总结与展望」被吞成 closing）
     const role = total <= 1 ? 'cover'
       : i === 0 ? 'cover'
-        : isClosingHeading(s.heading) ? 'closing'
-          : isSectionHeading(s.heading, body) ? 'section' : 'content';
+        : isSectionHeading(s.heading, body) ? 'section'
+          : isClosingHeading(s.heading) ? 'closing' : 'content';
     return { heading: s.heading, body, raw: `## ${s.heading}\n${body}`.trim(), role };
   });
 

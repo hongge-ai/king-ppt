@@ -22,5 +22,9 @@ ppt-master/
 # 本地临时评审/探针产物（统一前缀，.tmp- 开头一律不入库）
 .tmp-*
 
+# 用户流程实测/逐页截图产物（本机评审用，不入库）
+.user-flow-*
+slides/
+
 # Claude Code 本机个人配置（用户级全局 ignore 已挡一层，这里兜底其他机器）
 .claude/settings.local.json

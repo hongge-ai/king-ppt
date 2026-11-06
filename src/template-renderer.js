@@ -4,7 +4,7 @@
 // page by page and stays legible on any source palette (light or dark).
 const fs = require('fs');
 const path = require('path');
-const { readableOn } = require('./render-guard');
+const { readableOn, contrast } = require('./render-guard');
 
 const esc = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 const num = (v, fallback) => Number.isFinite(Number(v)) ? Number(v) : fallback;
@@ -17,6 +17,17 @@ const toDataUri = (file) => {
 const tok = (profile, key, fallback) => {
   const v = profile?.tokens?.[key];
   return v ? `#${String(v).replace('#', '')}` : fallback;
+};
+const cleanHex = (v) => {
+  const s = typeof v === 'string' ? v.trim().replace('#', '') : '';
+  return /^[0-9a-fA-F]{6}$/.test(s) ? s : null;
+};
+// 两色按 t 混合（t 越大越接近 b）——用于从 ink/bg 导出中性说明文字色，
+// 避免 muted 本身是品牌色（如藏青）时正文整段带色、违反强调色纪律
+const mixHex = (a, b, t) => {
+  const pa = [0, 2, 4].map((i) => parseInt(String(a).replace('#', '').slice(i, i + 2), 16));
+  const pb = [0, 2, 4].map((i) => parseInt(String(b).replace('#', '').slice(i, i + 2), 16));
+  return '#' + pa.map((v, i) => Math.round(v + (pb[i] - v) * t).toString(16).padStart(2, '0')).join('');
 };
 const px = (profile) => 1280 / num(profile?.canvas?.width, 13.333);
 const fontPx = (pt) => Math.max(12, num(pt, 20) * 96 / 72);
@@ -236,9 +247,9 @@ const rect = (profile, xIn, yIn, wIn, hIn, { fill, opacity, rx = 0, stroke, sw =
     + `${stroke ? ` stroke="${stroke}" stroke-width="${sw}"` : ''}/>`;
 };
 // A small deterministic line icon (rounded square + dot) to add card density.
-function geoIcon(profile, xIn, yIn, sIn, color) {
+function geoIcon(profile, xIn, yIn, sIn, color, rxIn = 0.05) {
   const s = px(profile);
-  return rect(profile, xIn, yIn, sIn, sIn, { stroke: color, sw: 1.6, rx: 0.05 })
+  return rect(profile, xIn, yIn, sIn, sIn, { stroke: color, sw: 1.6, rx: rxIn })
     + `<circle cx="${((xIn + sIn / 2) * s).toFixed(1)}" cy="${((yIn + sIn / 2) * s).toFixed(1)}" r="${(sIn * 0.16 * s).toFixed(1)}" fill="${color}"/>`;
 }
 // Shared page footer: a thin rule, a left walk label, and NN / TT page numbers.
@@ -254,7 +265,7 @@ function footerChrome(profile, { index, total, left, bodyFont, muted }) {
 }
 
 // ---------- content page: token-driven card system + bottom conclusion ----------
-function renderContent(profile, templateDir, section, index, total, imageData) {
+function renderContent(profile, templateDir, section, index, total, imageData, spec) {
   const scale = px(profile);
   const W = profile.canvas.width;
   const bg = tok(profile, 'bg', '#0B1120');
@@ -266,25 +277,41 @@ function renderContent(profile, templateDir, section, index, total, imageData) {
   const cardAccents = [accent, accent2]; // blue + amber alternation
   const bodyFontRaw = profile.invariants.fonts[1] || profile.invariants.fonts[0] || 'Microsoft YaHei';
   const bodyFont = esc(String(bodyFontRaw).startsWith('+') ? fontFamily(profile, bodyFontRaw) : bodyFontRaw);
+  // 反推规格旋钮：模板禁圆角（如学术规范的「直角无阴影」）则卡片直角；
+  // 禁阴影/渐变本渲染器默认就不产出，无需处理。
+  const forbidden = JSON.stringify((spec && spec.generalization && spec.generalization.forbidden) || '');
+  const cardRx = /圆角|胶囊/.test(forbidden) ? 0.004 : 0.06;
+  const iconRx = /圆角|胶囊/.test(forbidden) ? 0.008 : 0.05;
+  // 说明文字用中性深灰（ink 向 bg 混 34%）：muted 是品牌色（藏青/橙）的模板，
+  // 卡片正文不能整段带色——规格的强调色纪律「蓝色仅用于标题、节点和结构块」
+  const descFill = mixHex(ink.replace('#', ''), bg.replace('#', ''), 0.34);
 
-  const role = profile.roles.content;
-  const chrome = asset(profile, templateDir, 'content');
+  const role = profile.roles.content || null; // 无烘焙顶栏（素材包常见）→ 规格化白底版式，而非回落 LLM
+  const chrome = role && role.asset ? asset(profile, templateDir, 'content') : null;
   // 标题起点避开烘焙顶栏里的模板标记图形（图标在左的模板，标题从图标右侧起排）。
-  const titleX = chromeTitleInset(role.asset ? path.join(templateDir, role.asset) : null, W);
+  const titleX = chromeTitleInset(role && role.asset ? path.join(templateDir, role.asset) : null, W);
   // The measured content-title slot is unreliable (bake can pick a giant
   // decorative number elsewhere on the page as the "title"). Anchor the page
   // title on the baked top-bar at a page-title size; keep the measured
   // color/font when present.
-  const barH = Number(role.hIn) || 1.3;
+  const barH = Number(role && role.hIn) || 1.15;
+  // 反推规格的页标题色（如学术模板的藏青标题），无实测槽位色时优先于全局 ink
+  const specTitleColor = cleanHex(spec && spec.typography && spec.typography.pageTitle && spec.typography.pageTitle.color);
   const titleSlot = {
     rect: [titleX, Math.max(0.24, barH / 2 - 0.36), W - titleX - 0.84, 0.72],
-    size: Math.min(Math.max(Number(role.slot && role.slot.size) || 26, 20), 30),
-    color: readableOn(bg, role.slot && role.slot.color, [ink]), bold: true, align: 'left', font: role.slot && role.slot.font,
+    size: Math.min(Math.max(Number(role && role.slot && role.slot.size) || 26, 20), 30),
+    color: readableOn(bg, (role && role.slot && role.slot.color) || specTitleColor, [ink]), bold: true, align: 'left', font: role && role.slot && role.slot.font,
   };
   const tslot = titleSlot.rect;
   const title = textAtSlot(titleSlot, profile, section.heading, { maxLines: 1, fallbackColor: ink, maxSize: 30 });
+  // 标题装饰线：规格若描述「短粗线接长细线」（学术模板常见），画双段；否则单段 accent
+  const accentLineSpec = String((spec && spec.layoutGrammar && spec.layoutGrammar.accentLines) || '');
+  const underline = /短[\u4e00-\u9fa5]?线.*接.*长|长.*线.*接/.test(accentLineSpec)
+    ? rect(profile, titleX, tslot[1] + tslot[3] + 0.04, 0.9, 0.055, { fill: accent })
+      + rect(profile, titleX + 1.02, tslot[1] + tslot[3] + 0.055, Math.min(3.4, W - titleX - 2), 0.016, { fill: muted, opacity: 0.45 })
+    : rect(profile, titleX, tslot[1] + tslot[3] + 0.04, 1.15, 0.045, { fill: accent });
 
-  const [bx, by, bw] = role.bodyRect || [0.85, 1.6, W - 1.7, 0];
+  const [bx, by, bw] = (role && role.bodyRect) || [0.85, 1.6, W - 1.7, 0];
   const allItems = bodyItems(section);
   // 多行引用（诗/词/口诀）→ 诗文面板模式：诗行整体入面板，不再被截成一句当金句条。
   const quoteLines = String(section?.body || '').split('\n')
@@ -320,7 +347,7 @@ function renderContent(profile, templateDir, section, index, total, imageData) {
     const verseH = vRows * vLineH + vPad * 2;
     const verseY = footY - 0.3 - verseH;
     bandBottom = verseY - 0.3;
-    versePanel = rect(profile, bx, verseY, bw, verseH, { fill: panel, rx: 0.06 })
+    versePanel = rect(profile, bx, verseY, bw, verseH, { fill: panel, rx: cardRx })
       + rect(profile, bx, verseY, 0.1, verseH, { fill: accent2 });
     const colW = (bw - 1.1) / vCols;
     quoteLines.forEach((ln, i) => {
@@ -337,7 +364,7 @@ function renderContent(profile, templateDir, section, index, total, imageData) {
     // Single point with no takeaway → a centered key-message statement.
     const cardH = Math.min(bandH, 2.4);
     const top = cardTop + Math.max(0, (bandH - cardH) / 2);
-    parts += rect(profile, bx, top, bw, cardH, { fill: panel, rx: 0.06 });
+    parts += rect(profile, bx, top, bw, cardH, { fill: panel, rx: cardRx });
     parts += rect(profile, bx, top, bw, 0.09, { fill: accent });
     parts += textLine((bx + 0.55) * scale, (top + 0.95) * scale, '01', { size: 32, fill: accent, family: bodyFont, bold: true });
     const sp = splitPoint(cards[0]);
@@ -369,10 +396,10 @@ function renderContent(profile, templateDir, section, index, total, imageData) {
     for (let i = 0; i < n; i++) {
       const x = bx + i * (cardW + gap);
       const ac = cardAccents[i % cardAccents.length];
-      parts += rect(profile, x, rowTop, cardW, cardH, { fill: panel, rx: 0.06 });
+      parts += rect(profile, x, rowTop, cardW, cardH, { fill: panel, rx: cardRx });
       parts += rect(profile, x, rowTop, cardW, 0.09, { fill: ac }); // unified top accent bar
       parts += textLine((x + 0.32) * scale, (rowTop + 0.85) * scale, String(i + 1).padStart(2, '0'), { size: 27, fill: ac, family: bodyFont, bold: true });
-      parts += geoIcon(profile, x + cardW - 0.62, rowTop + 0.34, 0.32, ac);
+      parts += geoIcon(profile, x + cardW - 0.62, rowTop + 0.34, 0.32, ac, iconRx);
       const sp = splits[i];
       if (sp.desc) {
         const maxDesc = Math.max(1, Math.min(4, Math.floor((cardH - 1.95 - 0.22) / descLineH)));
@@ -396,7 +423,7 @@ function renderContent(profile, templateDir, section, index, total, imageData) {
 
   // Bottom conclusion bar: amber left edge + bold takeaway (source signature).
   if (conclusion) {
-    parts += rect(profile, bx, calloutY, bw, calloutH, { fill: panel, rx: 0.06 });
+    parts += rect(profile, bx, calloutY, bw, calloutH, { fill: panel, rx: cardRx });
     parts += rect(profile, bx, calloutY, 0.1, calloutH, { fill: accent2 });
     const sp = splitPoint(conclusion);
     parts += textBlock(profile, bx + 0.4, calloutY + 0.42, bw - 0.8, sp.desc ? `${sp.lead}　${sp.desc}` : conclusion, { size: 18, maxLines: 2, fill: ink, family: bodyFont, bold: true });
@@ -405,14 +432,14 @@ function renderContent(profile, templateDir, section, index, total, imageData) {
 
   const chap = section.chapter ? `${section.chapter.no}  ${section.chapter.title}` : '';
   // 章节 kicker 锚在烘焙顶栏右侧品牌区（logo/公司名）之前，避免压字
-  const logoLeft = chromeRightInset(role.asset ? path.join(templateDir, role.asset) : null, W);
+  const logoLeft = chromeRightInset(role && role.asset ? path.join(templateDir, role.asset) : null, W);
   const kEndIn = logoLeft > 0 ? logoLeft - 0.22 : W - 0.84;
   const kicker = section.chapter
     ? textLine(kEndIn * scale, (tslot[1] + 0.52) * scale, `${section.chapter.no} · ${section.chapter.title}`.slice(0, 22), { size: 14, fill: accent, family: bodyFont, anchor: 'end' })
     : '';
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 720">`
     + rect(profile, 0, 0, W, profile.canvas.height, { fill: bg })
-    + (chrome ? `<image x="0" y="0" width="1280" height="${(role.hIn * scale).toFixed(1)}" href="${chrome}"/>` : '')
+    + (chrome ? `<image x="0" y="0" width="1280" height="${(((role && role.hIn) || barH) * scale).toFixed(1)}" href="${chrome}"/>` : '')
     + parts + title + kicker
     + footerChrome(profile, { index, total, left: chap, bodyFont, muted })
     + `</svg>`;
@@ -431,7 +458,7 @@ function unlabel(s) {
 }
 
 // ---------- cover: full-bleed illustration + three-level title stack ----------
-function renderCover(profile, templateDir, section, imageData, docTitle) {
+function renderCover(profile, templateDir, section, imageData, docTitle, spec) {
   const W = profile.canvas.width; const H = profile.canvas.height;
   const bg = tok(profile, 'bg', '#0B1120');
   const ink = tok(profile, 'ink', '#F1F5F9');
@@ -442,10 +469,39 @@ function renderCover(profile, templateDir, section, imageData, docTitle) {
   const slots = frame?.slots || {};
   const scale = px(profile);
   const title = docTitle || section.heading;
-  const bodyTexts = [...(section.intro || []), ...String(section.body || '').split('\n')]
-    .map(cleanLine).map(unlabel).filter(Boolean);
-  const sub = bodyTexts[0] || (section.heading && section.heading !== title ? section.heading : '');
-  const tagline = bodyTexts[1] || '';
+  // 反推规格的封面文案挑选规则：textGrammar.prefer 列出应进副标题位的标签
+  // （如学术模板的「答辩人/指导教师/院校」），命中标签的行优先，其余按序补位。
+  const prefer = Array.isArray(spec?.roles?.cover?.textGrammar?.prefer) ? spec.roles.cover.textGrammar.prefer : null;
+  let sub = '';
+  let tagline = '';
+  if (prefer && prefer.length) {
+    const hits = [];
+    const rest = [];
+    for (const l of [...(section.intro || []), ...String(section.body || '').split('\n')]) {
+      const s = cleanLine(l);
+      if (!s) continue;
+      const m = s.match(/^([\u4e00-\u9fa5A-Za-z]{2,8})\s*[:：]\s*(.+)$/);
+      const label = m && !/^(主视觉|视觉|配图|插图|意象|画面|核心关键词|关键词)$/.test(m[1]) ? m[1] : null;
+      const text = label ? m[2].trim() : s;
+      if (label && prefer.some((p) => label.includes(p) || String(p).includes(label))) { if (hits.length < 2) hits.push(text); }
+      else rest.push(text);
+    }
+    sub = hits[0] || rest[0] || (section.heading && section.heading !== title ? section.heading : '');
+    tagline = hits[1] || (hits[0] ? rest[0] : rest[1]) || '';
+  } else {
+    const bodyTexts = [...(section.intro || []), ...String(section.body || '').split('\n')]
+      .map(cleanLine).map(unlabel).filter(Boolean);
+    sub = bodyTexts[0] || (section.heading && section.heading !== title ? section.heading : '');
+    tagline = bodyTexts[1] || '';
+  }
+  // 副标题与主标题重复或近重复（大纲「课题名称：XXX」剥标签后常为标题本身或其子串）
+  const dupWith = (a, b) => {
+    const x = String(a || '').replace(/[—－\s]/g, '');
+    const y = String(b || '').replace(/[—－\s]/g, '');
+    return x && y && (x === y || (x.length >= 6 && y.includes(x)) || (y.length >= 6 && x.includes(y)));
+  };
+  if (dupWith(sub, title) || dupWith(sub, title.match(/^(.+?)\s*——/)?.[1] || '')) { sub = tagline !== '' && !dupWith(tagline, title) ? tagline : ''; tagline = ''; }
+  else if (dupWith(tagline, title)) tagline = '';
 
   const tx = slots.title?.rect?.[0] ?? 0.73;
   const y = slots.title?.rect?.[1] ?? (H * 0.42);
@@ -488,17 +544,40 @@ function renderCover(profile, templateDir, section, imageData, docTitle) {
   };
   const titleFill = slotFill(slots.title, ink);
   const subFill = slotFill(slots.subtitle, muted);
-  const subX = !imageData && slots.subtitle?.rect ? slots.subtitle.rect[0] : tx;
+  // 副标题跟随槽位对齐（学术模板多为居中）
+  const subAlign = !imageData && slots.subtitle?.align === 'center' ? 'middle' : 'start';
+  const subXpx = subAlign === 'middle'
+    ? ((slots.subtitle.rect[0] + slots.subtitle.rect[2] / 2) * scale)
+    : (slots.subtitle?.rect ? slots.subtitle.rect[0] : tx) * scale;
   const tAlign = !imageData && slots.title?.align === 'center' ? 'middle' : 'start';
   const titleXpx = tAlign === 'middle' ? ((slots.title.rect[0] + slots.title.rect[2] / 2) * scale) : tx * scale;
 
-  let parts = '';
+  // 对比度护栏：烤底封面上标题直接压在模板照片/底图上。均色判定不够——照片
+  // 局部（楼体/树影）很深但平均亮度达标仍会看不清。沿标题行取左/中/右三块
+  // 分别采样，任一块与标题色不可分离，就只在标题行下垫一条底色横带。
+  let band = '';
+  const coverAssetP = profile.roles.cover?.asset ? path.join(templateDir, profile.roles.cover.asset) : null;
+  if (!imageData && coverAssetP) {
+    const c = cleanHex(titleFill);
+    const patchW = maxW / 3;
+    let anyBad = false;
+    for (let k = 0; k < 3 && !anyBad; k++) {
+      const surf = surfaceColorAt(coverAssetP, tx + k * patchW, Math.max(0, mainBase - mainH * 0.9), patchW, mainH * 1.15, W, H);
+      if (!surf) continue;
+      // 照片封面阈值 0.7：楼体/树影这类中高亮高频纹理上，黑字「平均能看、局部看不清」，
+      // 均色对比必须远高于普通文字阈值才可信
+      anyBad = !c || contrast(surf.replace('#', ''), c) < 0.7;
+    }
+    if (anyBad) band = rect(profile, tx - 0.4, y - 0.28, Math.max(maxW + 0.8, W - 2 * (tx - 0.4)), mainH + 0.62, { fill: tok(profile, 'bg', '#FFFFFF'), opacity: 0.72 });
+  }
+
+  let parts = band;
   if (imageData) {
     parts += rect(profile, tx, y - 0.36, 1.9, 0.035, { fill: accent2 });
   }
   parts += textLine(titleXpx, mainBase * scale, main, { size: mainPt, fill: titleFill, family: fontFamily(profile, '+mj'), bold: true, anchor: tAlign, boxWpx: maxW * scale });
   if (suffix) parts += textLine(titleXpx, sufBase * scale, suffix, { size: sufPt, fill: accent2, family: fontFamily(profile, '+mj'), bold: true, anchor: tAlign, boxWpx: maxW * scale });
-  if (showSub) parts += textLine(subX * scale, subBase * scale, sub, { size: subPt, fill: subFill, family: fontFamily(profile), boxWpx: maxW * scale });
+  if (showSub) parts += textLine(subXpx, subBase * scale, sub, { size: subPt, fill: subFill, family: fontFamily(profile), anchor: subAlign, boxWpx: maxW * scale });
   if (showTag) {
     parts += rect(profile, tx, tagBase - 0.26, 0.055, 0.34, { fill: accent2 });
     parts += textLine((tx + 0.2) * scale, tagBase * scale, tagline, { size: 15, fill: ink, family: fontFamily(profile), bold: true, boxWpx: maxW * scale });
@@ -517,20 +596,25 @@ function renderCover(profile, templateDir, section, imageData, docTitle) {
 }
 
 // ---------- section divider: illustration + oversized number + bilingual eyebrow ----------
-function renderSection(profile, templateDir, section, index, total, imageData) {
+function renderSection(profile, templateDir, section, index, total, imageData, docTitle, spec) {
   const scale = px(profile);
   const W = profile.canvas.width; const H = profile.canvas.height;
   const bg = tok(profile, 'bg', '#0B1120');
   const ink = tok(profile, 'ink', '#F1F5F9');
   const muted = tok(profile, 'muted', '#94A3B8');
   const accent = tok(profile, 'accent', '#38BDF8');
+  const accent2 = tok(profile, 'accent2', '#F59E0B');
   const bodyFont = esc(fontFamily(profile));
   const image = imageData || asset(profile, templateDir, 'section');
   const slots = profile.roles.section?.slots || {};
   const no = section.sectionNo || String(Math.max(1, index)).padStart(2, '0');
   const chapterTitle = String(section.heading || '').replace(/^第[一二三四五六七八九十百\d]+[章节]\s*[:：]?\s*/, '');
   const cnChapter = section.heading?.match(/^(第[一二三四五六七八九十百\d]+[章节])/)?.[1] || `第 ${no} 章`;
-  const eyebrow = `CHAPTER ${no} · ${cnChapter}`;
+  // 反推规格的编号风格：bilingual（默认）/ cn（只用「第N章」）/ numCn
+  const eyebrowStyle = spec?.layoutGrammar?.numbering || 'bilingual';
+  const eyebrow = eyebrowStyle === 'cn' ? cnChapter
+    : eyebrowStyle === 'numCn' ? `第 ${no} 章 · ${cnChapter}`
+      : `CHAPTER ${no} · ${cnChapter}`;
   const lead = leadOf(section) || String(section.body || '').split('\n').map((l) => l.replace(/^\s*[-*>]\s*/, '').trim()).filter(Boolean)[0] || '';
 
   const scrimImg = profile.scrim ? toDataUri(path.join(templateDir, profile.scrim)) : null;
@@ -540,7 +624,11 @@ function renderSection(profile, templateDir, section, index, total, imageData) {
       : rect(profile, 0, 0, W, H, { fill: bg, opacity: 0.42 });
   // 巨大章节序号 = 右下角半透明水印，垫在文字层之下（绘制顺序在 scrim 之后、文字之前）。
   // 不再使用 bake 测得的 sectionNo 槽位——那槽位与左侧文字栈在长标题下必然相撞。
-  const numberEl = textLine((W - 0.62) * scale, (H * 0.78) * scale, no, { size: 170, fill: accent, family: fontFamily(profile, '+mj'), bold: true, anchor: 'end', opacity: 0.26 });
+  // 颜色遵循规格强调色纪律：accentDiscipline 把「章节号」分给 accent2 时用 accent2
+  // （如深色科技模板的橙色章节巨字），否则用 accent。
+  const discipline = JSON.stringify((spec && spec.tokens && spec.tokens.accentDiscipline) || '');
+  const wmColor = /章节/.test(discipline) ? accent2 : accent;
+  const numberEl = textLine((W - 0.62) * scale, (H * 0.78) * scale, no, { size: 170, fill: wmColor, family: fontFamily(profile, '+mj'), bold: true, anchor: 'end', opacity: 0.26 });
 
   const tx = 0.84;
   const eyebrowY = H * 0.6;
@@ -607,12 +695,13 @@ function renderClosing(profile, templateDir, section, index, imageData, docTitle
     + `</svg>`;
 }
 
-function renderTemplateSlide({ profile, templateDir, section, role, index, total, imageData, docTitle }) {
-  if (role === 'cover') return renderCover(profile, templateDir, section, imageData, docTitle);
-  if (role === 'section') return renderSection(profile, templateDir, section, index, total, imageData);
+function renderTemplateSlide({ profile, templateDir, section, role, index, total, imageData, docTitle, spec }) {
+  if (role === 'cover') return renderCover(profile, templateDir, section, imageData, docTitle, spec);
+  if (role === 'section') return renderSection(profile, templateDir, section, index, total, imageData, docTitle, spec);
   if (role === 'closing') return renderClosing(profile, templateDir, section, index, imageData, docTitle);
-  if (!profile?.roles?.content) return null;
-  return renderContent(profile, templateDir, section, index, total, imageData);
+  // 内容页：即使没烤出 content 顶栏，也走规格化确定性版式（素材包模板常见），
+  // 绝不回落 LLM 自由渲染——那是「任意模板」崩坏的主要来源。
+  return renderContent(profile, templateDir, section, index, total, imageData, spec);
 }
 
 module.exports = { renderTemplateSlide, bodyItems, lines };

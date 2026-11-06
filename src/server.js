@@ -17,6 +17,7 @@ const llmprovider = require('./llmprovider');
 const genOutline = require('./generate-outline');
 const genDeck = require('./generate-deck');
 const { renderTemplateSlide } = require('./template-renderer');
+const reverseSpecMod = require('./reverse-spec');
 const { scoreDeck } = require('./style-score');
 
 const app = express();
@@ -167,6 +168,23 @@ app.post('/api/templates/extract', wrap(async (req, res) => {
   if (!data) return res.status(400).json({ error: '请上传 pptx 文件（base64）' });
   const buffer = Buffer.from(data, 'base64');
   res.json(await extractFromPptx(buffer, name || 'uploaded.pptx'));
+}));
+
+// 视觉反推：源模板逐页渲染图 + 机器测量画像 → TEMPLATE_SPEC（视觉语义层规格）。
+// 产物存模板目录 template-spec.json，供生成端（版式语法旋钮）与 QA 端（自检闭环）共用。
+app.post('/api/templates/:id/reverse-spec', wrap(async (req, res) => {
+  const d = loadDescriptor(req.params.id);
+  const sourcePath = path.join(d._dir, 'source.pptx');
+  if (!fs.existsSync(sourcePath)) return res.status(400).json({ error: '该模板没有 source.pptx 原件，无法反推' });
+  const profile = loadProfile(d._id);
+  const { spec } = await reverseSpecMod.reverseSpec({
+    buffer: fs.readFileSync(sourcePath),
+    profile,
+    outDir: path.join(d._dir, '.reverse'),
+    mediaDir: path.join(d._dir, '.media'),
+    specDir: d._dir,
+  });
+  res.json({ ok: true, spec });
 }));
 
 app.post('/api/templates', wrap(async (req, res) => {
@@ -358,6 +376,9 @@ app.post('/api/generate/deck', wrap(async (req, res) => {
   const profile = loadProfile(theme.id);
   const { title, sections } = genDeck.splitOutline(md);
   const total = sections.length;
+  const tplSpec = reverseSpecMod.loadTemplateSpec(theme._dir); // 反推规格（存在则驱动版式语法旋钮）
+  // 规格生效的整册画像：令牌校正（视觉判定的 bg/ink + 模板实测主色）
+  const effProfile = tplSpec ? reverseSpecMod.applySpecTokens(profile, tplSpec, theme.palette && theme.palette.primary) : profile;
 
   genDeck.acquire();
   try {
@@ -378,7 +399,7 @@ app.post('/api/generate/deck', wrap(async (req, res) => {
       const s = sections[i];
       const profilePolicy = spec.imagePolicy || { enabled: wantImages, roles: ['cover', 'section', 'closing'], size: '1024x1024', prompt: artDirection || profile?.imageStyle };
       const imageData = profile ? await genDeck.generateSlideImage({ role: s.role, index: i, docTitle: title, section: s, policy: profilePolicy, brief: briefs ? briefs[i] : null }) : null;
-      let svg = profile ? renderTemplateSlide({ profile, templateDir: theme._dir, section: s, role: s.role, index: i, total, imageData, docTitle: title }) : null;
+      let svg = profile ? renderTemplateSlide({ profile, templateDir: theme._dir, section: s, role: s.role, index: i, total, imageData, docTitle: title, spec: tplSpec }) : null;
       if (!svg) {
         svg = await genDeck.generateSlideSvg({ docTitle: title, section: s, role: s.role, index: i, total, spec });
         svg = await genDeck.addGeneratedImage(svg, { role: s.role, index: i, docTitle: title, section: s, policy: spec.imagePolicy });
@@ -424,7 +445,7 @@ app.post('/api/generate/slide', wrap(async (req, res) => {
     }
     const profilePolicy = spec.imagePolicy || { enabled: wantImages, roles: ['cover', 'section', 'closing'], size: '1024x1024', prompt: artDirection || profile?.imageStyle };
     const imageData = profile ? await genDeck.generateSlideImage({ role: section.role, index: idx, docTitle: title, section, policy: profilePolicy, brief: briefs ? briefs[idx] : null }) : null;
-    let svg = profile ? renderTemplateSlide({ profile, templateDir: theme._dir, section, role: section.role, index: idx, total, imageData, docTitle: title }) : null;
+    let svg = profile ? renderTemplateSlide({ profile, templateDir: theme._dir, section, role: section.role, index: idx, total, imageData, docTitle: title, spec: reverseSpecMod.loadTemplateSpec(theme._dir) }) : null;
     if (!svg) {
       svg = await genDeck.generateSlideSvg({ docTitle: title, section, role: section.role, index: idx, total, spec, feedback });
       svg = await genDeck.addGeneratedImage(svg, { role: section.role, index: idx, docTitle: title, section, policy: spec.imagePolicy });

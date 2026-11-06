@@ -7,6 +7,7 @@ const JSZip = require('jszip');
 const { XMLParser } = require('fast-xml-parser');
 const { parseSourcePages } = require('./pptx-pages');
 const { bakeTemplateAssets, bakeScrim } = require('./bake');
+const pngSample = require('./png-sample');
 
 const textOf = (page) => (page.objects || [])
   .filter((o) => o.type === 'shape' && o.texts && o.texts.length)
@@ -47,27 +48,59 @@ const mix = (a, b, t) => {
 };
 
 // Derive a contrast-correct, generic token set from the measured palette.
-// ink = main text (high contrast vs bg), muted = secondary text, panel = card
-// surface (near bg but separable and still readable under ink), accent/2/3 =
-// saturated marks. Works for dark and light source decks — no sample constants.
+// 认领次序是关键：①强调色（品牌身份色）→②ink→③muted/panel（中性阶）。
+// 旧版反着来（先 muted 后 accent），低饱和单色系模板的品牌色会被 muted 的
+// 灰阶闸门抢走。 Works for dark and light source decks — no sample constants.
+const isNeutralish = (hex) => saturation(hex) < 0.045;
+const hueOf = (hex) => {
+  const h = String(hex).replace('#', '');
+  const [r, g, b] = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16) / 255);
+  const max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
+  if (!d) return -1;
+  let hue;
+  if (max === r) hue = ((g - b) / d) % 6;
+  else if (max === g) hue = (b - r) / d + 2;
+  else hue = (r - g) / d + 4;
+  return ((hue * 60) + 360) % 360;
+};
+const hueDist = (a, b) => {
+  const ha = hueOf(a), hb = hueOf(b);
+  if (ha < 0 || hb < 0) return 999;
+  return Math.min(Math.abs(ha - hb), 360 - Math.abs(ha - hb));
+};
 function deriveTokens(palette, bg, roles) {
   const isDark = lum(bg) < 0.5;
+  // ① 强调色：非中性的品牌色按"饱和度×出现量"排序，同色系（色相差<35°）
+  // 只保留最强的一个；低饱和单色系设计在此自然胜出，而非被过滤后落到兜底蓝。
+  const chromatic = palette
+    .filter((p) => p.hex !== bg && !isNeutralish(p.hex))
+    .sort((a, b) => saturation(b.hex) * Math.sqrt(b.uses || 1) - saturation(a.hex) * Math.sqrt(a.uses || 1));
+  const used = new Set([bg]);
+  const accents = [];
+  for (const p of chromatic) {
+    if (used.has(p.hex)) continue;
+    if (accents.some((h) => hueDist(h, p.hex) < 35)) continue;
+    accents.push(p.hex);
+    used.add(p.hex);
+    if (accents.length >= 3) break;
+  }
+  // ② 主文字
   const measuredTitle = roles.content?.slot?.color || roles.cover?.slots?.title?.color;
   let ink = measuredTitle && contrast(measuredTitle, bg) > 0.45 ? measuredTitle : null;
-  if (!ink) {
-    ink = palette.filter((p) => contrast(p.hex, bg) > 0.5 && (isDark ? lum(p.hex) > 0.55 : lum(p.hex) < 0.4))
+  if (!ink || used.has(ink)) {
+    ink = palette.filter((p) => !used.has(p.hex) && contrast(p.hex, bg) > 0.5 && (isDark ? lum(p.hex) > 0.55 : lum(p.hex) < 0.4))
       .sort((a, b) => b.uses - a.uses)[0]?.hex || (isDark ? 'F1F5F9' : '111827');
   }
-  const muted = palette.filter((p) => p.hex !== ink && p.hex !== bg
-    && contrast(p.hex, bg) > 0.22 && contrast(p.hex, bg) < contrast(ink, bg))
+  used.add(ink);
+  // ③ 次级文字 / 卡片面：中性阶优先，绝不占用品牌强调色
+  const muted = palette.filter((p) => !used.has(p.hex) && isNeutralish(p.hex)
+    && contrast(p.hex, bg) > 0.16 && contrast(p.hex, bg) < contrast(ink, bg))
     .sort((a, b) => b.uses - a.uses)[0]?.hex || mix(ink, bg, 0.45);
-  const panel = palette.filter((p) => p.hex !== bg && contrast(p.hex, bg) <= 0.16 && contrast(p.hex, ink) > 0.4)
+  used.add(muted);
+  const panel = palette.filter((p) => !used.has(p.hex) && contrast(p.hex, bg) <= 0.16 && contrast(p.hex, ink) > 0.4)
     .sort((a, b) => b.uses - a.uses)[0]?.hex || mix(bg, ink, isDark ? 0.09 : 0.06);
-  const used = new Set([bg, ink, panel, muted]);
-  const accents = palette.filter((p) => !used.has(p.hex) && saturation(p.hex) > 0.28 && contrast(p.hex, bg) > 0.12)
-    .sort((a, b) => saturation(b.hex) * Math.sqrt(b.uses) - saturation(a.hex) * Math.sqrt(a.uses))
-    .map((p) => p.hex);
-  const accent = accents[0] || (isDark ? '38BDF8' : '2563EB');
+  // 真正无彩色的模板：强调色从墨-底中导出（近灰阶标记），绝不发明外来色相
+  const accent = accents[0] || mix(ink, bg, isDark ? 0.32 : 0.55);
   return { bg, ink, muted, panel, accent, accent2: accents[1] || accent, accent3: accents[2] || accents[1] || accent, isDark };
 }
 
@@ -157,7 +190,28 @@ async function profileFromPptx(buffer, { stagingDir } = {}) {
     extraction: { mode: 'baked-reference', confidence: roles.cover && roles.content ? 0.92 : 0.68 },
   };
   // Smooth gradient overlay mask (transparent -> bg) for cover/section imagery.
-  try { profile.scrim = await bakeScrim(stagingDir, tokens.bg); } catch { profile.scrim = null; }
+  // 渐隐目标取"封面文字带以下区域自己的平均色"，而不是全局 bg：遮罩的语义是
+  // 让画面向其所在环境的基调自然过渡。纯灰/纯彩封面若被渐隐到全局白底，
+  // 会把整页洗成半透明渐变（实测三伏贴灰底封面被冲成白雾）。
+  let scrimTarget = tokens.bg;
+  try {
+    const coverAsset = roles.cover?.asset && path.join(stagingDir, roles.cover.asset);
+    if (coverAsset && fs.existsSync(coverAsset)) {
+      const img = pngSample.decode(fs.readFileSync(coverAsset));
+      const pts = [];
+      for (let y = Math.floor(img.h * 0.62); y < img.h; y += 4) {
+        for (let x = Math.floor(img.w * 0.15); x < img.w * 0.85; x += 8) {
+          const p = pngSample.pxAt(img, x, y);
+          pts.push(p);
+        }
+      }
+      if (pts.length) {
+        const avg = [0, 1, 2].map((i) => Math.round(pts.reduce((s, p) => s + p[i], 0) / pts.length));
+        scrimTarget = '#' + avg.map((v) => v.toString(16).padStart(2, '0')).join('').toUpperCase();
+      }
+    }
+  } catch { /* 采样失败则退回全局 bg */ }
+  try { profile.scrim = await bakeScrim(stagingDir, scrimTarget); } catch { profile.scrim = null; }
   fs.writeFileSync(path.join(stagingDir, 'template-profile.json'), JSON.stringify(profile, null, 2));
   return profile;
 }
@@ -168,4 +222,4 @@ function loadTemplateProfile(dir) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
 }
 
-module.exports = { profileFromPptx, loadTemplateProfile, contentMetrics, themeFonts };
+module.exports = { profileFromPptx, loadTemplateProfile, contentMetrics, themeFonts, deriveTokens };
