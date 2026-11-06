@@ -342,6 +342,16 @@ const openaiAdapter = {
       delete body.temperature;
       data = await postJSON(`${ctx.baseURL}/chat/completions`, { key: ctx.apiKey, body, timeoutMs });
     }
+    // 推理模型（DeepSeek flash、o 系列等）会把预算先花在 reasoning 上：max_tokens 偏小时
+    // finish_reason=length 且 content 为空，真正的答案一个字都没写。这不是「模型返回空」，
+    // 而是预算不够——放大预算重试一次，而不是把空结果当成失败抛给用户。
+    const msg = data.choices?.[0]?.message || {};
+    const reasoning = msg.reasoning_content || msg.reasoning || '';
+    if (!msg.content && data.choices?.[0]?.finish_reason === 'length' && reasoning) {
+      const bigger = Math.min(Math.max((Number(maxTokens) || 2000) * 4, 8000), 32000);
+      body.max_tokens = bigger;
+      data = await postJSON(`${ctx.baseURL}/chat/completions`, { key: ctx.apiKey, body, timeoutMs });
+    }
     const content = data.choices?.[0]?.message?.content;
     if (!content) throw fail('模型返回内容为空', 'LLM_EMPTY');
     return content;
