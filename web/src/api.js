@@ -26,6 +26,13 @@ export const api = {
   // 多模态长任务，上传保存后触发一次，后续生成与验收共用这份规格。
   analyzeTemplate: (id) => req(`/api/templates/${encodeURIComponent(id)}/analyze`, { method: 'POST', body: {} }),
   deleteTheme: (id) => req(`/api/templates/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  // 历史任务：一册 deck + 大纲的不可变快照。打开 = 塞回服务端 relay，之后编辑作用于工作副本。
+  history: () => req('/api/history'),
+  newPresentation: () => req('/api/new', { method: 'POST', body: {} }),
+  archiveHistory: () => req('/api/history/archive', { method: 'POST', body: {} }),
+  openHistory: (id) => req(`/api/history/${encodeURIComponent(id)}/open`, { method: 'POST', body: {} }),
+  renameHistory: (id, title) => req(`/api/history/${encodeURIComponent(id)}`, { method: 'PATCH', body: { title } }),
+  deleteHistory: (id) => req(`/api/history/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   // 演示态快照（刷新/重连恢复）：deck=整册幻灯片，doc=内容大纲
   deck: () => req('/api/deck'),
   styleScore: () => req('/api/deck/style-score'),

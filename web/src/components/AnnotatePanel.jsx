@@ -23,7 +23,7 @@ export default function AnnotatePanel({ activeIndex, hasSlides, busy, onAnnotate
         className="annotate-input"
         rows={3}
         value={text}
-        placeholder={'对当前页提修改意见，AI 按意见重画\n例：把这页配色改成更冷静的蓝灰，标题再大一点'}
+        placeholder={'说说这页要改什么，例如：配色更冷静，标题再大一点'}
         onChange={(e) => setText(e.target.value)}
         onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }}
       />

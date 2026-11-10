@@ -3,14 +3,13 @@ import { api, subscribe } from './api.js';
 import PageRail from './components/PageRail.jsx';
 import SlideCanvas from './components/SlideCanvas.jsx';
 import AnnotatePanel from './components/AnnotatePanel.jsx';
-import ThemeGallery from './components/ThemeGallery.jsx';
 import ThemePreview from './components/ThemePreview.jsx';
 import OutlineView from './components/OutlineView.jsx';
 import OutlineBatchPanel from './components/OutlineBatchPanel.jsx';
 import SettingsPanel from './components/SettingsPanel.jsx';
 import { useAppDialog, AppDialogHost } from './components/AppDialog.jsx';
 
-// 卷王PPT · 独立生成程序（server-gen）。一条线性向导：
+// 卷王PPT · 独立生成程序（server-gen）。聊天式工作台中依次完成：
 //   ① 内容大纲（生成/批注/定稿） → ② 选择模板（预览确认） → ③ 幻灯片（逐页流式生成/就地编辑/单页重画/导出）。
 // deck 与 doc 的权威都在服务端；本页经 SSE 收 deck/slide/doc 事件驱动渲染，经 REST 触发生成与编辑。
 const STEPS = [
@@ -18,6 +17,8 @@ const STEPS = [
   { key: 'theme', no: 2, label: '选择模板' },
   { key: 'slides', no: 3, label: '幻灯片' },
 ];
+
+const ROLE_LABEL = { cover: '封面', section: '章节', content: '内容', closing: '结束' };
 
 // 模板卡片的色板预览：优先 primary/accent，回退到画像令牌 ink 或中性色。
 function swatchOf(t) {
@@ -44,6 +45,11 @@ export default function App() {
   const [connected, setConnected] = useState(false);
   const [providers, setProviders] = useState(null); // 多供应商配置视图（不含明文 key）
   const [showSettings, setShowSettings] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [historyItems, setHistoryItems] = useState([]);
+  const [editingHistoryId, setEditingHistoryId] = useState(null);
+  const [editingHistoryTitle, setEditingHistoryTitle] = useState('');
+  const [historyBusyId, setHistoryBusyId] = useState(null);
   const [topic, setTopic] = useState('');       // 阶段1 主题输入
   const deckVersionRef = useRef(0);
   const docVersionRef = useRef(0);
@@ -56,10 +62,60 @@ export default function App() {
     setTimeout(() => setToast(null), 3000);
   }, []);
 
+  const refreshHistory = useCallback(async () => {
+    try {
+      const r = await api.history();
+      setHistoryItems(Array.isArray(r.items) ? r.items : []);
+    } catch { /* 历史列表不可用时不阻断创作 */ }
+  }, []);
+
+  const onArchiveCurrent = useCallback(async () => {
+    if (!deck.slides.some(Boolean) || busy) return;
+    try {
+      const r = await api.archiveHistory();
+      if (r.skipped === 'duplicate') flash('当前内容已在历史记录中', 'info');
+      else if (r.skipped === 'empty') flash('当前没有可存档的幻灯片', 'error');
+      else flash('已存入历史演示文稿', 'ok');
+      refreshHistory();
+    } catch (e) { flash(`存档失败：${e.message}`, 'error'); }
+  }, [deck.slides, busy, flash, refreshHistory]);
+
+  const onRenameHistory = useCallback(async (event, id) => {
+    event.preventDefault();
+    const title = editingHistoryTitle.trim();
+    if (!title) { flash('标题不能为空', 'error'); return; }
+    setHistoryBusyId(id);
+    try {
+      const r = await api.renameHistory(id, title);
+      setHistoryItems(Array.isArray(r.items) ? r.items : []);
+      setEditingHistoryId(null);
+      setEditingHistoryTitle('');
+      flash('历史标题已更新', 'ok');
+    } catch (e) { flash(`重命名失败：${e.message}`, 'error'); }
+    finally { setHistoryBusyId(null); }
+  }, [editingHistoryTitle, flash]);
+
+  const onDeleteHistory = useCallback(async (item) => {
+    const ok = await dialog.ask({
+      title: '删除历史演示文稿？',
+      body: `将永久删除「${item.title || '未命名演示文稿'}」，此操作无法撤销。`,
+      okText: '删除',
+    });
+    if (!ok) return;
+    setHistoryBusyId(item.id);
+    try {
+      const r = await api.deleteHistory(item.id);
+      setHistoryItems(Array.isArray(r.items) ? r.items : []);
+      flash('历史演示文稿已删除', 'ok');
+    } catch (e) { flash(`删除失败：${e.message}`, 'error'); }
+    finally { setHistoryBusyId(null); }
+  }, [dialog, flash]);
+
   // 初始化：拉主题列表 + 供应商配置 + 当前 deck / doc 快照（刷新/重连恢复）
   useEffect(() => {
     api.listThemes().then((r) => setThemes(r.templates || [])).catch(() => {});
     api.getProviders().then(setProviders).catch(() => {});
+    refreshHistory();
     api.deck().then((st) => {
       if (st && Array.isArray(st.slides)) {
         deckVersionRef.current = st.version || 0;
@@ -74,9 +130,10 @@ export default function App() {
         if (d.version && d.version < docVersionRef.current) return;
         docVersionRef.current = d.version || 0;
         setDocState({ markdown: d.markdown, title: d.title || '', version: d.version || 0 });
+        setTopic(d.title || '');
       }
     }).catch(() => {});
-  }, []);
+  }, [refreshHistory]);
 
   // SSE 订阅：整册替换 / 单页写入 / 大纲替换。丢弃过期版本回放（version 单调）。
   useEffect(() => {
@@ -214,6 +271,58 @@ export default function App() {
     } catch (e) { flash(`删除失败：${e.message}`, 'error'); }
   }, [dialog, flash]);
 
+  const onOpenHistory = useCallback(async (item) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      const r = await api.openHistory(item.id);
+      initedRef.current = true;
+      setStep(r.pages > 0 ? 'slides' : 'outline');
+      setActiveIndex(0);
+      setSelectedThemeId(r.meta && r.meta.templateId ? r.meta.templateId : '');
+      setTopic(r.meta && r.meta.title ? r.meta.title : '');
+      setSidebarOpen(false);
+      flash(`已打开「${item.title}」`, 'ok');
+      refreshHistory();
+    } catch (e) {
+      flash(`打开失败：${e.message}`, 'error');
+    } finally { setBusy(false); }
+  }, [busy, flash, refreshHistory]);
+
+  const onNewPresentation = useCallback(async () => {
+    if (busy) return;
+    if (hasSlides || hasDoc) {
+      const ok = await dialog.ask({
+        title: '新建演示文稿？',
+        body: hasSlides
+          ? '当前幻灯片会先保存到历史记录。尚未出片的大纲不会单独保留。'
+          : '当前大纲尚未生成幻灯片，开始新建后会清空。',
+        okText: '新建',
+      });
+      if (!ok) return;
+    }
+    setBusy(true);
+    try {
+      const r = await api.newPresentation();
+      deckVersionRef.current = r.deckVersion || 0;
+      docVersionRef.current = r.docVersion || 0;
+      initedRef.current = true;
+      setDeck({ title: '', themeId: null, slides: [], version: r.deckVersion || 0 });
+      setDocState({ markdown: '', title: '', version: r.docVersion || 0 });
+      setHistoryItems(Array.isArray(r.history) ? r.history : []);
+      setSelectedThemeId('');
+      setTopic('');
+      setStep('outline');
+      setSidebarOpen(false);
+      setActiveIndex(0);
+      setOutlineComments([]);
+      setActiveCommentId(null);
+      flash('已新建演示文稿', 'ok');
+    } catch (e) {
+      flash(`新建失败：${e.message}`, 'error');
+    } finally { setBusy(false); }
+  }, [busy, hasSlides, hasDoc, dialog, flash]);
+
   // 确认用此模板：切到出片步，服务端逐页流式生成（结果经 SSE 实时冒页）
   const onConfirmTheme = useCallback((themeId) => {
     if (!hasModel) { flash('请先在右上角「模型设置」绑定文本模型', 'error'); return; }
@@ -226,8 +335,8 @@ export default function App() {
     api.generateDeck(themeId, aiImages)
       .then((r) => flash(r.recovered?.length ? `生成完成，其中 ${r.recovered.length} 页需重画` : '生成完成', 'ok'))
       .catch((e) => flash(`生成失败：${e.message}`, 'error'))
-      .finally(() => setBusy(false));
-  }, [hasModel, flash, aiImages]);
+      .finally(() => { setBusy(false); refreshHistory(); });
+  }, [hasModel, flash, aiImages, refreshHistory]);
 
   // ---------- 阶段1：内容大纲 ----------
   const onAddComment = useCallback((c) => setOutlineComments((prev) => [...prev, c]), []);
@@ -301,10 +410,21 @@ export default function App() {
   }, [deck, hasSlides, flash]);
 
   const scrollToSlide = useCallback((i) => {
-    setActiveIndex(i);
-    const el = document.getElementById(`slide-${i}`);
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setActiveIndex(Math.max(0, i));
   }, []);
+
+  // 键盘翻页：出片步用 ← → 切页（焦点在输入框/文本框时不拦截）
+  useEffect(() => {
+    if (step !== 'slides') return undefined;
+    const onKey = (e) => {
+      const tag = (e.target && e.target.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable)) return;
+      if (e.key === 'ArrowLeft') { e.preventDefault(); setActiveIndex((i) => Math.max(0, i - 1)); }
+      if (e.key === 'ArrowRight') { e.preventDefault(); setActiveIndex((i) => Math.min(deck.slides.length - 1, i + 1)); }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [step, deck.slides.length]);
 
   // 步骤可达性：大纲随时可回；选模板需已有大纲；幻灯片需已生成
   const canGo = useCallback((key) => {
@@ -322,88 +442,217 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      <header className="topbar">
-        <div className="brand"><span className="brand-logo">卷</span><span className="brand-name">卷王PPT</span></div>
-        <div className="stepper">
-          {STEPS.map((s) => (
-            <button
-              key={s.key}
-              className={`step${step === s.key ? ' on' : ''}${canGo(s.key) ? '' : ' locked'}`}
-              disabled={!canGo(s.key)}
-              onClick={() => canGo(s.key) && setStep(s.key)}
-            >
-              <span className="step-no">{s.no}</span>
-              <span className="step-label">{s.label}</span>
-            </button>
-          ))}
+      <aside className={`chat-sidebar${sidebarOpen ? ' open' : ''}`}>
+        <div className="sidebar-brand">
+          <span className="brand-logo">卷</span>
+          <span className="brand-name">卷王PPT</span>
         </div>
-        <div className="deck-title">{headerTitle}</div>
-        <div className="topbar-right">
-          <span className={`conn-dot${connected ? ' on' : ''}`} title={connected ? '已连接' : '未连接'} />
-          {styleScore ? <span className={`score-chip${styleScore.pass ? ' pass' : ''}`} title="模板风格评分：配色、字体、版式、图片槽位与正文页一致性综合评分">风格 {styleScore.score.toFixed(1)}</span> : null}
-          <button className="model-chip" title="模型设置" onClick={() => setShowSettings(true)}>
-            <span className={`chip-dot${hasModel ? ' ok' : ''}`} />
-            <span className="model-info">{hasModel ? `${providers.active.chat.instanceName} · ${providers.active.chat.model}` : '未配置模型'}</span>
+        <button className="new-chat-btn" disabled={busy} onClick={onNewPresentation}>
+          <span aria-hidden="true">＋</span>新建演示文稿
+        </button>
+        <div className="sidebar-section-label">当前项目</div>
+        {hasSlides || hasDoc ? (
+          <button className="sidebar-history-item current" onClick={() => { setStep(hasSlides ? 'slides' : 'outline'); setActiveIndex(0); setSidebarOpen(false); }}>
+            <span className="sidebar-history-mark">▧</span>
+            <span className="sidebar-history-copy">
+              <span className="sidebar-history-title">{deck.title || doc.title || '未命名演示文稿'}</span>
+              <span className="sidebar-history-meta">{hasSlides ? `${slides.length} 页 · 当前项目` : '大纲草稿'}</span>
+            </span>
           </button>
-          <button className="icon-btn" title="模型设置" onClick={() => setShowSettings(true)}>⚙</button>
-          <button className="btn btn-primary" disabled={!hasSlides || busy} onClick={onExport}>导出 PPTX</button>
+        ) : <div className="sidebar-current-empty">还没有打开的演示文稿</div>}
+        <div className="sidebar-section-label history-section-label">
+          <span>历史演示文稿</span>
+          <span className="sidebar-history-count">{historyItems.length}</span>
         </div>
-      </header>
-
-      {step === 'outline' ? (
-        <div className="workarea">
-          <aside className="left-rail">
-            <div className="gen-box">
-              <label className="field-label">主题</label>
-              <textarea
-                className="gen-topic"
-                placeholder="输入演示主题，例如：给大一新生的时间管理分享"
-                value={topic}
-                onChange={(e) => setTopic(e.target.value)}
-              />
-              <button className="btn btn-primary" disabled={busy || !topic.trim() || !hasModel} onClick={onGenerateOutline}>
-                {hasDoc ? '重新生成大纲' : '生成大纲'}
+        <nav className="sidebar-history" aria-label="历史演示文稿">
+          {historyItems.map((item) => (
+            <div key={item.id} className="sidebar-history-entry">
+              {editingHistoryId === item.id ? (
+                <form className="sidebar-rename-form" onSubmit={(e) => onRenameHistory(e, item.id)}>
+                  <input
+                    autoFocus
+                    maxLength={80}
+                    aria-label="历史演示文稿标题"
+                    value={editingHistoryTitle}
+                    disabled={historyBusyId === item.id}
+                    onChange={(e) => setEditingHistoryTitle(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Escape') { setEditingHistoryId(null); setEditingHistoryTitle(''); }
+                    }}
+                  />
+                  <button type="submit" disabled={historyBusyId === item.id} title="保存标题" aria-label="保存标题">✓</button>
+                  <button type="button" disabled={historyBusyId === item.id} title="取消重命名" aria-label="取消重命名" onClick={() => { setEditingHistoryId(null); setEditingHistoryTitle(''); }}>×</button>
+                </form>
+              ) : (
+                <>
+                  <button className="sidebar-history-item" disabled={busy || historyBusyId !== null} onClick={() => onOpenHistory(item)}>
+                    <span className="sidebar-history-mark">▤</span>
+                    <span className="sidebar-history-copy">
+                      <span className="sidebar-history-title">{item.title || '未命名演示文稿'}</span>
+                      <span className="sidebar-history-meta">{item.pages || 0} 页 · {item.templateName || '历史项目'}</span>
+                    </span>
+                  </button>
+                  <div className="sidebar-history-actions">
+                    <button className="sidebar-history-action" disabled={historyBusyId !== null} title="重命名" aria-label={`重命名 ${item.title || '历史演示文稿'}`} onClick={() => { setEditingHistoryId(item.id); setEditingHistoryTitle(item.title || ''); }}>✎</button>
+                    <button className="sidebar-history-action danger" disabled={historyBusyId !== null} title="删除" aria-label={`删除 ${item.title || '历史演示文稿'}`} onClick={() => onDeleteHistory(item)}>×</button>
+                  </div>
+                </>
+              )}
+            </div>
+          ))}
+          {historyItems.length === 0 ? <div className="sidebar-history-empty">还没有历史演示文稿</div> : null}
+        </nav>
+        <div className="sidebar-footer">
+          {hasSlides ? (
+            <button className="sidebar-action" disabled={busy} onClick={onArchiveCurrent}>
+              <span aria-hidden="true">▣</span><span>存档当前</span>
+            </button>
+          ) : null}
+          <button className="sidebar-action" onClick={() => setShowSettings(true)}>
+            <span aria-hidden="true">⚙</span><span>模型设置</span>
+          </button>
+          <div className="sidebar-model-status">
+            <span className={`conn-dot${connected ? ' on' : ''}`} />
+            <span>{hasModel ? providers.active.chat.model : '尚未配置模型'}</span>
+          </div>
+        </div>
+      </aside>
+      {sidebarOpen ? <button className="sidebar-backdrop" aria-label="关闭侧栏" onClick={() => setSidebarOpen(false)} /> : null}
+      <div className="app-main">
+        <header className="topbar">
+          <button className="mobile-sidebar-toggle icon-btn" title="显示历史演示文稿" aria-label="显示历史演示文稿" onClick={() => setSidebarOpen(true)}>☰</button>
+          <div className="topbar-context">
+            <div className="deck-title">{headerTitle}</div>
+            <div className="topbar-caption">{step === 'outline' ? '输入主题，整理成可编辑的大纲' : step === 'theme' ? '选择视觉风格，生成整套幻灯片' : '预览、修改并导出演示文稿'}</div>
+          </div>
+          <div className="stepper">
+            {STEPS.map((s) => (
+              <button
+                key={s.key}
+                className={`step${step === s.key ? ' on' : ''}${canGo(s.key) ? '' : ' locked'}`}
+                disabled={!canGo(s.key)}
+                onClick={() => canGo(s.key) && setStep(s.key)}
+              >
+                <span className="step-no">{s.no}</span>
+                <span className="step-label">{s.label}</span>
               </button>
-              {!hasModel ? <div className="rail-tip">请先在右上角「模型设置」绑定文本模型</div> : null}
-              <div className="rail-divider" />
-            </div>
-            <div
-              className="mat-drop"
-              onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('over'); }}
-              onDragLeave={(e) => e.currentTarget.classList.remove('over')}
-              onDrop={(e) => { e.preventDefault(); e.currentTarget.classList.remove('over'); uploadFiles(e.dataTransfer.files); }}
-            >
-              <div className="mat-drop-icon">📎</div>
-              <div className="mat-drop-text">拖入参考素材<br />（pdf / docx / md / txt / 图片）</div>
-            </div>
-          </aside>
+            ))}
+          </div>
+          <div className="topbar-right">
+            {styleScore ? <span className={`score-chip${styleScore.pass ? ' pass' : ''}`} title="模板风格评分：配色、字体、版式、图片槽位与正文页一致性综合评分">风格 {styleScore.score.toFixed(1)}</span> : null}
+            <button className="model-chip" title="模型设置" onClick={() => setShowSettings(true)}>
+              <span className={`chip-dot${hasModel ? ' ok' : ''}`} />
+              <span className="model-info">{hasModel ? `${providers.active.chat.instanceName} · ${providers.active.chat.model}` : '未配置模型'}</span>
+            </button>
+            <button className="btn btn-primary" disabled={!hasSlides || busy} onClick={onExport}>导出 PPTX</button>
+          </div>
+        </header>
 
-          <main className="stage">
-            <OutlineView
-              markdown={doc.markdown}
-              version={doc.version}
-              comments={outlineComments}
-              activeCommentId={activeCommentId}
-              onAddComment={onAddComment}
-              onActivateComment={onActivateComment}
-            />
-          </main>
-
-          <aside className="right-panel">
-            <OutlineBatchPanel
-              comments={outlineComments}
-              busy={busy}
-              hasDoc={hasDoc}
-              activeCommentId={activeCommentId}
-              onRemove={onRemoveComment}
-              onActivate={onActivateComment}
-              onSend={onSendBatch}
-              onFinalize={onFinalize}
-            />
-          </aside>
-        </div>
+        {step === 'outline' ? (
+          <div className={`workarea chat-workarea${hasDoc ? ' has-outline' : ''}`}>
+            <main className="chat-thread">
+              <div
+                className="chat-thread-scroll"
+                onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('drag'); }}
+                onDragLeave={(e) => e.currentTarget.classList.remove('drag')}
+                onDrop={(e) => { e.preventDefault(); e.currentTarget.classList.remove('drag'); uploadFiles(e.dataTransfer.files); }}
+              >
+                {!hasDoc ? (
+                  <div className="chat-welcome">
+                    <span className="welcome-mark">卷</span>
+                    <p className="welcome-kicker">卷王PPT 助手</p>
+                    <h1>先说说你想讲什么</h1>
+                    <p>输入一个主题，我会先整理出逐页大纲。你可以批注修改，再选择模板生成幻灯片。</p>
+                    <div className="prompt-suggestions">
+                      <button onClick={() => setTopic('大模型的发展')}>大模型的发展</button>
+                      <button onClick={() => setTopic('产品方案介绍')}>产品方案介绍</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="chat-message-list">
+                    <div className="chat-turn user-turn">
+                      <span className="chat-avatar user-avatar">你</span>
+                      <div className="user-bubble">
+                        <span className="message-label">演示主题</span>
+                        <p>{doc.title || topic || '未命名演示文稿'}</p>
+                      </div>
+                    </div>
+                    <div className="chat-turn assistant-turn">
+                      <span className="chat-avatar assistant-avatar">卷</span>
+                      <div className="assistant-message">
+                        <div className="assistant-message-head">
+                          <div>
+                            <strong>内容大纲</strong>
+                            <span>可选中文字添加批注</span>
+                          </div>
+                          <span className={`message-state${busy ? ' working' : ''}`}>{busy ? '正在整理…' : '草稿'}</span>
+                        </div>
+                        <OutlineView
+                          markdown={doc.markdown}
+                          version={doc.version}
+                          comments={outlineComments}
+                          activeCommentId={activeCommentId}
+                          onAddComment={onAddComment}
+                          onActivateComment={onActivateComment}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="chat-compose-area">
+                <div className={`chat-composer${busy ? ' busy' : ''}`}>
+                  <textarea
+                    className="chat-input"
+                    aria-label="演示文稿主题"
+                    placeholder="输入演示主题，例如：给管理层讲解大模型的发展"
+                    value={topic}
+                    onChange={(e) => setTopic(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onGenerateOutline(); }
+                    }}
+                  />
+                  <div className="chat-composer-footer">
+                    <label className="chat-attach" title="添加参考资料">
+                      <span aria-hidden="true">＋</span>添加资料
+                      <input
+                        type="file"
+                        multiple
+                        accept=".pdf,.docx,.md,.txt,.png,.jpg,.jpeg,.webp"
+                        onChange={(e) => { uploadFiles(e.target.files); e.target.value = ''; }}
+                      />
+                    </label>
+                    <span className="chat-compose-note">{hasModel ? 'Enter 发送 · Shift+Enter 换行' : '先配置文本模型即可开始'}</span>
+                    <button className="chat-send-btn" disabled={busy || !topic.trim() || !hasModel} onClick={onGenerateOutline} aria-label={hasDoc ? '重新生成大纲' : '生成大纲'}>
+                      {busy ? '…' : '↑'}
+                    </button>
+                  </div>
+                </div>
+                <div className="chat-compose-caption">
+                  <span>支持拖入参考资料</span>
+                  {!hasModel ? <button className="link-btn" onClick={() => setShowSettings(true)}>配置模型</button> : null}
+                  {hasDoc ? <button className="btn btn-primary btn-sm" disabled={busy} onClick={onFinalize}>确认大纲并选择模板</button> : null}
+                </div>
+              </div>
+            </main>
+            {hasDoc ? (
+              <aside className="right-panel chat-context">
+                <OutlineBatchPanel
+                  comments={outlineComments}
+                  busy={busy}
+                  hasDoc={hasDoc}
+                  activeCommentId={activeCommentId}
+                  onRemove={onRemoveComment}
+                  onActivate={onActivateComment}
+                  onSend={onSendBatch}
+                  onFinalize={onFinalize}
+                  showFinalize={false}
+                />
+              </aside>
+            ) : null}
+          </div>
       ) : step === 'theme' ? (
-        <div className="workarea">
+        <div className="workarea theme-workarea">
           <main
             className="stage stage-theme"
             onDragOver={(e) => { e.preventDefault(); e.currentTarget.classList.add('drag'); }}
@@ -454,13 +703,19 @@ export default function App() {
           </main>
         </div>
       ) : (
-        <div className="workarea">
-          <aside className="left-rail">
-            <ThemeGallery themes={themes} selectedId={activeThemeId} onPreview={onPreviewTheme} />
-            {hasSlides ? <PageRail slides={deck.slides} activeIndex={activeIndex} onSelect={scrollToSlide} /> : null}
+        <div className="workarea slide-workarea">
+          <aside className="left-rail rail-pages">
+            {hasSlides ? (
+              <>
+                <div className="page-rail-label">页面 {slides.length}</div>
+                <PageRail slides={deck.slides} activeIndex={activeIndex} onSelect={scrollToSlide} />
+              </>
+            ) : (
+              <div className="theme-gallery-empty">生成后这里会出现页面缩略图</div>
+            )}
           </aside>
 
-          <main className="stage">
+          <main className="stage stage-single">
             {!hasSlides ? (
               <div className="empty">
                 <div className="empty-art">🎞️</div>
@@ -468,23 +723,38 @@ export default function App() {
                 <div className="empty-sub">{busy ? '页面会逐张实时出现；生成后点击文字即可就地编辑' : '回到「选择模板」步，挑一套风格开始生成'}</div>
               </div>
             ) : (
-              deck.slides.map((s, i) => s ? (
-                <div className="stage-slide" id={`slide-${i}`} key={i}>
-                  <SlideCanvas
-                    svg={s.svg}
-                    index={i}
-                    editable
-                    active={i === activeIndex}
-                    onSelect={setActiveIndex}
-                    onEdit={onEdit}
-                  />
-                  {s._recovered ? (
-                    <div className="slide-recovered">
-                      此页未能正确生成，<button className="link-btn" disabled={busy} onClick={() => onRegenerate(i)}>重新生成</button>
-                    </div>
-                  ) : null}
+              <>
+                <div className="stage-bar">
+                  <div className="stage-bar-left">
+                    <span className="stage-page-no">{activeIndex + 1} / {slides.length}</span>
+                    <span className="stage-page-role">{ROLE_LABEL[slides[activeIndex] && slides[activeIndex].role] || ''}</span>
+                    {busy ? <span className="stage-gen">正在生成…</span> : null}
+                  </div>
+                  <div className="stage-bar-right">
+                    <button className="btn btn-ghost" disabled={activeIndex <= 0} onClick={() => setActiveIndex((i) => Math.max(0, i - 1))}>← 上一页</button>
+                    <button className="btn btn-ghost" disabled={activeIndex >= slides.length - 1} onClick={() => setActiveIndex((i) => Math.min(slides.length - 1, i + 1))}>下一页 →</button>
+                  </div>
                 </div>
-              ) : null)
+                <div className="stage-viewport">
+                  <div className="stage-slide" id={`slide-${activeIndex}`} key={activeIndex}>
+                    {slides[activeIndex] ? (
+                      <SlideCanvas
+                        svg={slides[activeIndex].svg}
+                        index={activeIndex}
+                        editable
+                        active
+                        onSelect={setActiveIndex}
+                        onEdit={onEdit}
+                      />
+                    ) : <div className="canvas-fail">此页尚未生成</div>}
+                    {slides[activeIndex] && slides[activeIndex]._recovered ? (
+                      <div className="slide-recovered">
+                        此页未能正确生成，<button className="link-btn" disabled={busy} onClick={() => onRegenerate(activeIndex)}>重新生成</button>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              </>
             )}
           </main>
 
@@ -518,6 +788,7 @@ export default function App() {
       ) : null}
       <AppDialogHost dialog={dialog} />
       {toast ? <div className={`toast ${toast.type}`}>{toast.text}</div> : null}
+      </div>
     </div>
   );
 }

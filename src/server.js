@@ -12,6 +12,7 @@ const normalizeOutline = require('./normalize-outline');
 const materials = require('./materials');
 const { buildSpec } = require('./spec');
 const { createRelay } = require('./relay');
+const history = require('./history');
 const { RUNTIME_FILE } = require('./paths');
 const llmprovider = require('./llmprovider');
 const genOutline = require('./generate-outline');
@@ -37,6 +38,17 @@ app.use((req, res, next) => {
   return (large ? jsonBodyLarge : jsonBody)(req, res, next);
 });
 app.use(express.static(path.join(__dirname, '..', 'public')));
+
+// 画布规格归一：主题层用 {vbWidth,vbHeight}（SVG viewBox），pptx 编译器要 {width,height}
+// （英寸）。历史快照存的是前者，导出时必须转换，否则 defineLayout 拿不到 width 直接抛错。
+function coerceCanvas(c) {
+  if (!c || typeof c !== 'object') return null;
+  if (Number(c.width) > 0 && Number(c.height) > 0) return { width: Number(c.width), height: Number(c.height) };
+  if (Number(c.vbWidth) > 0 && Number(c.vbHeight) > 0) {
+    return { width: Number(c.vbWidth) / 80, height: Number(c.vbHeight) / 80 }; // 1280×720 → 16×9 英寸
+  }
+  return null;
+}
 
 function statusOf(err) {
   if (err.code === 'SESSION_NOT_FOUND' || err.code === 'ASSET_NOT_FOUND') return 404;
@@ -235,6 +247,66 @@ app.delete('/api/templates/:id', wrap(async (req, res) => {
   res.json({ ok: true, templates: listDescriptors() });
 }));
 
+// ---------- 历史任务 ----------
+// 快照 = 一册 deck + 对应大纲，不可变。打开历史即塞回 relay，之后所有编辑都作用于工作副本。
+app.get('/api/history', (req, res) => {
+  res.json({ items: history.list() });
+});
+
+app.post('/api/new', wrap(async (req, res) => {
+  const current = relay.getState();
+  let archived = null;
+  if (current.slides.some(Boolean)) {
+    const template = current.templateId ? listDescriptors().find((t) => t.id === current.templateId) : null;
+    archived = history.archive({
+      deck: current,
+      doc: relay.getDoc(),
+      templateName: template ? (template.name || template.id) : null,
+    });
+  }
+  const deckVersion = relay.setDeck({ title: '', templateId: null, canvas: null, slides: [] });
+  const docVersion = relay.setDoc({ markdown: '', title: '' });
+  res.json({
+    deck: relay.getState(),
+    doc: relay.getDoc(),
+    history: history.list(),
+    archived,
+    deckVersion,
+    docVersion,
+  });
+}));
+
+// 手动存档当前演示态（生成前自动存档，这里供「存档当前」按钮使用）
+app.post('/api/history/archive', wrap(async (req, res) => {
+  const st = relay.getState();
+  const tpl = st.templateId ? listDescriptors().find((t) => t.id === st.templateId) : null;
+  res.json(history.archive({
+    deck: st,
+    doc: relay.getDoc(),
+    templateName: tpl ? (tpl.name || tpl.id) : null,
+  }));
+}));
+
+// 打开某一册：快照 → relay（deck + doc），并推 SSE 让所有已连接浏览器同步切过去
+app.post('/api/history/:id/open', wrap(async (req, res) => {
+  const { meta, deck, doc } = history.load(req.params.id);
+  relay.setDeck({ title: deck.title, templateId: deck.templateId, canvas: deck.canvas, slides: deck.slides });
+  relay.setDoc(doc || { markdown: '', title: '' });
+  // 模板可能已被删除：此时仍可编辑与导出（导出只依赖 canvas），但不能重画
+  const templateAvailable = Boolean(deck.templateId && listDescriptors().some((t) => t.id === deck.templateId));
+  res.json({ meta, pages: deck.slides.length, templateAvailable, hasDoc: Boolean(doc) });
+}));
+
+app.patch('/api/history/:id', wrap(async (req, res) => {
+  const item = history.rename(req.params.id, req.body && req.body.title);
+  res.json({ item, items: history.list() });
+}));
+
+app.delete('/api/history/:id', wrap(async (req, res) => {
+  history.remove(req.params.id);
+  res.json({ ok: true, items: history.list() });
+}));
+
 // ---------- 配图 ----------
 // 配图存储：POST /api/assets（base64/url）→ 存 → 返回可内联的 slide.image 载荷（配图生成未来接入）
 app.post('/api/assets', wrap(async (req, res) => {
@@ -418,6 +490,15 @@ app.post('/api/generate/deck', wrap(async (req, res) => {
 
   genDeck.acquire();
   try {
+    // 生成前先把当前册冻成历史快照——否则下面这行落空册会直接抹掉上一册内容。
+    // 空册/重复内容由 archive 自行跳过，不会堆积垃圾条目。
+    const prev = relay.getState();
+    if (prev.slides && prev.slides.some(Boolean)) {
+      const prevTpl = prev.templateId ? listDescriptors().find((t) => t.id === prev.templateId) : null;
+      try {
+        history.archive({ deck: prev, doc: relay.getDoc(), templateName: prevTpl ? (prevTpl.name || prevTpl.id) : null });
+      } catch { /* 归档失败不阻塞生成 */ }
+    }
     // 先落空册（含 title/templateId/canvas），浏览器据此切到出片步等待逐页冒出
     relay.setDeck({ title, templateId: theme.id, canvas: theme.canvas, slides: [] });
     // Fidelity-first: by default封面/章节复刻模板烘焙设计（imageData=null→baked）。
@@ -533,13 +614,23 @@ app.get('/api/stream', (req, res) => {
 });
 
 app.post('/api/export', wrap(async (req, res) => {
-  const { slides, title, themeId, templateId } = req.body;
+  const { slides, title, themeId, templateId, canvas } = req.body;
   if (!Array.isArray(slides) || slides.length === 0) {
     return res.status(400).json({ error: '没有可导出的幻灯片' });
   }
   // SVG-as-IR：每页 slide.svg 经 svgToScene 编译为原生 pptx 对象，无需 Chrome 栅格化
-  const d = loadDescriptor(themeId || templateId);
-  const buf = await buildPptx(slides, title, d._id, { canvas: d.canvas });
+  // 模板可能已删除（历史册）：导出只依赖 canvas 与 slide.svg 本身，故降级继续，
+  // 不能因为模板没了就导不出历史内容。
+  let id = themeId || templateId || '';
+  let cv = coerceCanvas(canvas);
+  try {
+    const d = loadDescriptor(id);
+    id = d._id;
+    cv = cv || d.canvas;
+  } catch (e) {
+    if (e.code !== 'TEMPLATE_NOT_FOUND') throw e;
+  }
+  const buf = await buildPptx(slides, title, id, cv ? { canvas: cv } : undefined);
   const filename = encodeURIComponent((title || 'slides') + '.pptx');
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.presentationml.presentation');
   res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${filename}`);
