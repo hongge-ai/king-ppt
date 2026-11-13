@@ -11,8 +11,8 @@ const { HOME } = require('./paths');
 const DECK_FILE = path.join(HOME, 'relay-deck.json');
 const DOC_FILE = path.join(HOME, 'relay-doc.json');
 
-function createRelay() {
-  const deck = { title: '', templateId: null, canvas: null, slides: [], version: 0 };
+function createRelay({ onChange = () => {} } = {}) {
+  const deck = { title: '', projectTitle: '', taskId: null, templateId: null, canvas: null, slides: [], version: 0 };
   const doc = { markdown: '', title: '', version: 0 };
   const subscribers = new Set(); // SSE 响应对象（浏览器侧）
 
@@ -38,20 +38,24 @@ function createRelay() {
 
   function getState() {
     return {
-      title: deck.title, templateId: deck.templateId, canvas: deck.canvas,
+      title: deck.title, projectTitle: deck.projectTitle || deck.title, taskId: deck.taskId || null, templateId: deck.templateId, canvas: deck.canvas,
       slides: deck.slides, version: deck.version,
     };
   }
 
   // 整册替换（如逐页生成前建空册）。slides 已由 server 归一。
-  function setDeck({ title, templateId, canvas, slides }) {
+  function setDeck({ title, projectTitle, taskId, templateId, canvas, slides }) {
     if (title !== undefined) deck.title = title;
+    if (projectTitle !== undefined) deck.projectTitle = projectTitle;
+    else if (title !== undefined && !deck.projectTitle) deck.projectTitle = title;
+    if (taskId !== undefined) deck.taskId = taskId;
     if (templateId !== undefined) deck.templateId = templateId;
     if (canvas !== undefined) deck.canvas = canvas;
     deck.slides = Array.isArray(slides) ? slides : [];
     const version = bump();
     persistDeck();
     broadcast('deck', { ...getState() });
+    onChange();
     return version;
   }
 
@@ -63,6 +67,25 @@ function createRelay() {
     const version = bump();
     persistDeck();
     broadcast('slide', { index, slide, canvas: deck.canvas, version });
+    onChange();
+    return version;
+  }
+
+  function setTaskId(taskId) {
+    deck.taskId = taskId || null;
+    const version = bump();
+    persistDeck();
+    broadcast('deck', { ...getState() });
+    onChange();
+    return version;
+  }
+
+  function setProjectTitle(projectTitle) {
+    deck.projectTitle = String(projectTitle || '');
+    const version = bump();
+    persistDeck();
+    broadcast('deck', { ...getState() });
+    onChange();
     return version;
   }
 
@@ -77,6 +100,7 @@ function createRelay() {
     doc.version += 1;
     persistDoc();
     broadcast('doc', getDoc());
+    onChange();
     return doc.version;
   }
 
@@ -100,7 +124,7 @@ function createRelay() {
   }
 
   return {
-    getState, setDeck, setSlide,
+    getState, setDeck, setSlide, setTaskId, setProjectTitle,
     getDoc, setDoc,
     subscribe, broadcast, pingAll,
   };

@@ -15,6 +15,12 @@ const MAX_MEDIA = 20 * 1024 * 1024;
 // parseTagValue:false —— 文本节点保持字符串，否则 "01" 会被转成数字丢失前导零
 const xml = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', removeNSPrefix: true, parseTagValue: false });
 const asArray = (v) => (v === undefined || v === null ? [] : Array.isArray(v) ? v : [v]);
+const textNodeValue = (v) => {
+  if (v === undefined || v === null) return '';
+  if (typeof v === 'string' || typeof v === 'number') return String(v);
+  if (typeof v === 'object' && Object.prototype.hasOwnProperty.call(v, '#text')) return String(v['#text'] ?? '');
+  return '';
+};
 const emu2in = (v) => Number(v) / EMU;
 const r1 = (v) => Math.round(v * 100) / 100;
 
@@ -140,7 +146,7 @@ function textsOf(sp, ctx) {
       const rPr = r.rPr || {};
       const c = rPr.solidFill ? colorFrom(rPr.solidFill, ctx) : null;
       return {
-        text: r.t !== undefined ? String(r.t) : '',
+        text: textNodeValue(r.t),
         size: rPr['@_sz'] ? Number(rPr['@_sz']) / 100 : null,
         bold: rPr['@_b'] === '1' || rPr['@_b'] === true,
         italic: rPr['@_i'] === '1' || rPr['@_i'] === true,
@@ -457,4 +463,4 @@ async function parseSourcePages(buffer, opts = {}) {
   return { canvas, pages };
 }
 
-module.exports = { parseSourcePages };
+module.exports = { parseSourcePages, textNodeValue };

@@ -7,13 +7,16 @@ const { resolve } = require('./layout-resolver'); // 仅供旧模板画廊 sampl
 const assets = require('./assets');
 const { extractFromPptx, saveTemplate } = require('./extract');
 const { parseSourcePages } = require('./pptx-pages');
+const { pageToHtml } = require('./bake');
+const htmlShot = require('./html-shot');
 const normalize = require('./normalize');
 const normalizeOutline = require('./normalize-outline');
 const materials = require('./materials');
 const { buildSpec } = require('./spec');
 const { createRelay } = require('./relay');
 const history = require('./history');
-const { RUNTIME_FILE } = require('./paths');
+const { HOME, RUNTIME_FILE } = require('./paths');
+const { createGenerationJobs } = require('./generation-jobs');
 const llmprovider = require('./llmprovider');
 const genOutline = require('./generate-outline');
 const genDeck = require('./generate-deck');
@@ -23,7 +26,63 @@ const { planDeck, renderHints } = require('./page-plan');
 const { scoreDeck } = require('./style-score');
 
 const app = express();
-const relay = createRelay(); // 演示态存储（deck/doc）+ SSE 广播总线
+let relay;
+let taskSyncSuppressed = false;
+function templateNameOf(id) {
+  if (!id) return '';
+  const item = listDescriptors().find((t) => t.id === id);
+  return item ? (item.name || item.id) : id;
+}
+function syncActiveTask() {
+  if (!relay || taskSyncSuppressed) return;
+  const deck = relay.getState();
+  if (deck.taskId) {
+    history.updateTask(deck.taskId, { deck, doc: relay.getDoc() });
+    relay.broadcast('history', history.list());
+  }
+}
+relay = createRelay({ onChange: syncActiveTask }); // deck/doc 持久化并同步到当前对话任务
+const generationJobs = createGenerationJobs({
+  file: path.join(HOME, 'deck-generation.json'),
+  onChange: (job) => {
+    relay.broadcast('generation', job);
+    if (job && ['completed', 'failed', 'interrupted'].includes(job.status)) relay.broadcast('history', history.list());
+  },
+});
+
+function ensureCurrentTask({ title, prompt } = {}) {
+  const deck = relay.getState();
+  if (deck.taskId) return { id: deck.taskId, created: false };
+  const existing = history.findByFingerprint(deck);
+  if (existing) {
+    relay.setTaskId(existing.id);
+    relay.setProjectTitle(existing.title);
+    if (prompt && history.messagesFor(existing.id).length === 0) appendTaskMessage('user', prompt);
+    return { id: existing.id, created: false };
+  }
+  const templateName = templateNameOf(deck.templateId);
+  const task = history.createTask({ title, prompt, deck, doc: relay.getDoc(), templateName });
+  relay.setTaskId(task.id);
+  relay.setProjectTitle(task.title);
+  return { id: task.id, created: true };
+}
+
+function appendTaskMessage(role, content) {
+  const taskId = relay.getState().taskId;
+  if (!taskId || !String(content || '').trim()) return null;
+  const message = history.appendMessage(taskId, { role, content });
+  relay.broadcast('history', history.list());
+  return message;
+}
+
+// 升级旧版单工作区快照：服务已有成品但尚无 taskId 时，将它一次性迁入对话历史。
+{
+  const deck = relay.getState();
+  const doc = relay.getDoc();
+  if (!deck.taskId && (deck.slides.some(Boolean) || doc.markdown.trim())) {
+    ensureCurrentTask({ title: deck.projectTitle || deck.title || doc.title, prompt: doc.title || deck.title });
+  }
+}
 
 // 上传模板 / 就地编辑整页 SVG / 配图以 base64 进 JSON，放宽体积；其余路由维持 2mb
 const jsonBody = express.json({ limit: '2mb' });
@@ -147,20 +206,48 @@ app.get('/api/templates/:id/assets/:file', wrap(async (req, res) => {
 
 // 模板整册预览：上传模板解析 source.pptx 还原「原件每一页」；预设模板渲染 8 类版式效果页
 const tplPreviewCache = new Map(); // id -> { mtime, data }
+const previewImageCache = new Map(); // source page thumbnail cache
+async function sourcePreviewFor(d, id) {
+  const sourcePath = path.join(d._dir, 'source.pptx');
+  if (!fs.existsSync(sourcePath)) return null;
+  const mtime = fs.statSync(sourcePath).mtimeMs;
+  let hit = tplPreviewCache.get(id);
+  if (!hit || hit.mtime !== mtime) {
+    hit = { mtime, data: await parseSourcePages(fs.readFileSync(sourcePath), { mediaDir: path.join(d._dir, '.media') }) };
+    tplPreviewCache.set(id, hit);
+    if (tplPreviewCache.size > 8) tplPreviewCache.delete(tplPreviewCache.keys().next().value);
+  }
+  return { mtime, sourcePath, data: hit.data, mediaDir: path.join(d._dir, '.media') };
+}
+
+function sourceRolePages(profile, pageCount) {
+  const role = profile && profile.roles || {};
+  const pageFor = (key, fallback) => {
+    const index = Number(role[key] && role[key].sourcePage);
+    return Number.isInteger(index) && index >= 0 && index < pageCount ? index : Math.max(0, Math.min(fallback, pageCount - 1));
+  };
+  return {
+    cover: pageFor('cover', 0),
+    section: pageFor('section', Math.min(1, pageCount - 1)),
+    content: pageFor('content', Math.min(2, pageCount - 1)),
+    closing: pageFor('closing', pageCount - 1),
+  };
+}
+
 app.get('/api/templates/:id/preview', wrap(async (req, res) => {
   const { id } = req.params;
   if (!/^[a-zA-Z0-9_-]+$/.test(id)) return res.status(400).json({ error: '非法的模板 id' });
   const d = loadDescriptor(id);
-  const sourcePath = path.join(d._dir, 'source.pptx');
-  if (fs.existsSync(sourcePath)) {
-    const mtime = fs.statSync(sourcePath).mtimeMs;
-    let hit = tplPreviewCache.get(id);
-    if (!hit || hit.mtime !== mtime) {
-      hit = { mtime, data: await parseSourcePages(fs.readFileSync(sourcePath), { mediaDir: path.join(d._dir, '.media') }) };
-      tplPreviewCache.set(id, hit);
-      if (tplPreviewCache.size > 8) tplPreviewCache.delete(tplPreviewCache.keys().next().value);
+  const source = await sourcePreviewFor(d, id);
+  if (source) {
+    const profile = loadProfile(id);
+    if (req.query.summary === '1') {
+      return res.json({
+        kind: 'source', name: d.meta.name, canvas: source.data.canvas,
+        pageCount: source.data.pages.length, rolePages: sourceRolePages(profile, source.data.pages.length),
+      });
     }
-    return res.json({ kind: 'source', name: d.meta.name, canvas: hit.data.canvas, pages: hit.data.pages });
+    return res.json({ kind: 'source', name: d.meta.name, canvas: source.data.canvas, pages: source.data.pages });
   }
   const samples = [
     { index: 0, type: 'title', title: '演示文稿标题', subtitle: '副标题示例文字' },
@@ -172,15 +259,33 @@ app.get('/api/templates/:id/preview', wrap(async (req, res) => {
     { index: 6, type: 'quote', quote: '别人熬夜做的，没你十分钟做的好。', author: '卷王PPT' },
     { index: 7, type: 'stats', title: '关键数字', stats: [{ value: '87%', label: '效率提升' }, { value: '10分钟', label: '平均出稿' }] },
   ];
-  res.json({
-    kind: 'descriptor',
-    name: d.meta.name,
-    canvas: d.canvas,
-    types: samples.map((s) => s.type),
-    scenes: resolve(d, samples, { title: d.meta.name }).slides,
-  });
+  if (req.query.summary === '1') {
+    return res.json({ kind: 'descriptor', name: d.meta.name, canvas: d.canvas, types: samples.map((s) => s.type) });
+  }
+  res.json({ kind: 'descriptor', name: d.meta.name, canvas: d.canvas, types: samples.map((s) => s.type), scenes: resolve(d, samples, { title: d.meta.name }).slides });
 }));
 
+app.get('/api/templates/:id/preview-image/:index', wrap(async (req, res) => {
+  const { id } = req.params;
+  const index = Number(req.params.index);
+  if (!/^[a-zA-Z0-9_-]+$/.test(id) || !Number.isInteger(index) || index < 0) {
+    return res.status(400).json({ error: '非法的模板 id 或页码' });
+  }
+  const d = loadDescriptor(id);
+  const source = await sourcePreviewFor(d, id);
+  if (!source) return res.status(404).json({ error: '该模板没有可预览的源文件' });
+  if (index >= source.data.pages.length) return res.status(404).json({ error: '模板页码不存在' });
+  const key = `${id}:${source.mtime}:${index}`;
+  let png = previewImageCache.get(key);
+  if (!png) {
+    const html = pageToHtml(source.data.pages[index], source.data.canvas, source.mediaDir);
+    png = await htmlShot.renderToPng(html, { width: 1280, height: 720, scale: 1 });
+    previewImageCache.set(key, png);
+    if (previewImageCache.size > 32) previewImageCache.delete(previewImageCache.keys().next().value);
+  }
+  res.setHeader('Cache-Control', 'private, max-age=300');
+  res.type('png').send(png);
+}));
 // 原件预览引用的媒体（首次 preview 时解包到模板目录 .media/ 缓存）
 app.get('/api/templates/:id/media/:file', wrap(async (req, res) => {
   const { id, file } = req.params;
@@ -247,64 +352,79 @@ app.delete('/api/templates/:id', wrap(async (req, res) => {
   res.json({ ok: true, templates: listDescriptors() });
 }));
 
-// ---------- 历史任务 ----------
-// 快照 = 一册 deck + 对应大纲，不可变。打开历史即塞回 relay，之后所有编辑都作用于工作副本。
+// ---------- 历史对话任务 ----------
+// 每条记录代表一次对话；首次提示词创建任务，后续修改持续更新同一份 deck/doc 快照。
 app.get('/api/history', (req, res) => {
   res.json({ items: history.list() });
 });
 
+app.get('/api/generate/deck/status', (req, res) => {
+  res.json({ job: generationJobs.get() });
+});
+
 app.post('/api/new', wrap(async (req, res) => {
-  const current = relay.getState();
-  let archived = null;
-  if (current.slides.some(Boolean)) {
-    const template = current.templateId ? listDescriptors().find((t) => t.id === current.templateId) : null;
-    archived = history.archive({
-      deck: current,
-      doc: relay.getDoc(),
-      templateName: template ? (template.name || template.id) : null,
-    });
+  if (generationJobs.isActive() || genDeck.isBusy()) {
+    const error = new Error('整册生成尚未结束，完成或失败后再新建演示文稿');
+    error.code = 'BUSY';
+    throw error;
   }
-  const deckVersion = relay.setDeck({ title: '', templateId: null, canvas: null, slides: [] });
+  const deckVersion = relay.setDeck({ title: '', projectTitle: '', taskId: null, templateId: null, canvas: null, slides: [] });
   const docVersion = relay.setDoc({ markdown: '', title: '' });
   res.json({
     deck: relay.getState(),
     doc: relay.getDoc(),
     history: history.list(),
-    archived,
     deckVersion,
     docVersion,
   });
 }));
 
-// 手动存档当前演示态（生成前自动存档，这里供「存档当前」按钮使用）
-app.post('/api/history/archive', wrap(async (req, res) => {
-  const st = relay.getState();
-  const tpl = st.templateId ? listDescriptors().find((t) => t.id === st.templateId) : null;
-  res.json(history.archive({
-    deck: st,
-    doc: relay.getDoc(),
-    templateName: tpl ? (tpl.name || tpl.id) : null,
-  }));
+app.get('/api/history/:id/messages', wrap(async (req, res) => {
+  res.json({ messages: history.messagesFor(req.params.id) });
 }));
-
-// 打开某一册：快照 → relay（deck + doc），并推 SSE 让所有已连接浏览器同步切过去
 app.post('/api/history/:id/open', wrap(async (req, res) => {
+  if (generationJobs.isActive() || genDeck.isBusy()) {
+    const error = new Error('整册生成尚未结束，暂时不能切换历史项目');
+    error.code = 'BUSY';
+    throw error;
+  }
   const { meta, deck, doc } = history.load(req.params.id);
-  relay.setDeck({ title: deck.title, templateId: deck.templateId, canvas: deck.canvas, slides: deck.slides });
-  relay.setDoc(doc || { markdown: '', title: '' });
+  taskSyncSuppressed = true;
+  try {
+    relay.setDeck({ title: deck.title, projectTitle: meta.title || deck.projectTitle || deck.title, taskId: meta.id, templateId: deck.templateId, canvas: deck.canvas, slides: deck.slides });
+    relay.setDoc(doc || { markdown: '', title: '' });
+  } finally {
+    taskSyncSuppressed = false;
+  }
+  // Reopening a task is access, not a modification, so it must not move ahead of newer edits.
   // 模板可能已被删除：此时仍可编辑与导出（导出只依赖 canvas），但不能重画
   const templateAvailable = Boolean(deck.templateId && listDescriptors().some((t) => t.id === deck.templateId));
-  res.json({ meta, pages: deck.slides.length, templateAvailable, hasDoc: Boolean(doc) });
+  res.json({ meta, deckTitle: deck.title, pages: deck.slides.length, templateAvailable, hasDoc: Boolean(doc), messages: history.messagesFor(meta.id) });
 }));
 
 app.patch('/api/history/:id', wrap(async (req, res) => {
   const item = history.rename(req.params.id, req.body && req.body.title);
-  res.json({ item, items: history.list() });
+  if (relay.getState().taskId === item.id) relay.setProjectTitle(item.title);
+  const items = history.list();
+  relay.broadcast('history', items);
+  res.json({ item, items });
 }));
 
 app.delete('/api/history/:id', wrap(async (req, res) => {
+  if (relay.getState().taskId === req.params.id) {
+    if (generationJobs.isActive() || genDeck.isBusy()) {
+      const error = new Error('当前对话正在生成，暂时不能删除');
+      error.code = 'BUSY';
+      throw error;
+    }
+    relay.setTaskId(null);
+    relay.setDeck({ title: '', projectTitle: '', taskId: null, templateId: null, canvas: null, slides: [] });
+    relay.setDoc({ markdown: '', title: '' });
+  }
   history.remove(req.params.id);
-  res.json({ ok: true, items: history.list() });
+  const items = history.list();
+  relay.broadcast('history', items);
+  res.json({ ok: true, items });
 }));
 
 // ---------- 配图 ----------
@@ -455,23 +575,33 @@ app.post('/api/generate/outline', wrap(async (req, res) => {
     const cur = relay.getDoc().markdown;
     const clean = normalizeOutline.normalizeComments(comments, cur); // 剔除已失效引用（quote 不在当前大纲中）
     if (clean.length === 0) return res.status(400).json({ error: '批注均已失效（引用不在当前大纲中）' });
+    const existingTask = relay.getState().taskId;
+    ensureCurrentTask({ title: relay.getDoc().title || '演示文稿', prompt: relay.getDoc().title || '演示文稿' });
+    if (existingTask) appendTaskMessage('user', clean.map((c) => `引用：${c.quote}\n修改：${c.comment}`).join('\n\n'));
     markdown = await genOutline.reviseOutline({ markdown: cur, comments: clean });
   } else {
+    const prompt = String(topic || '').trim();
+    if (!prompt) return res.status(400).json({ error: '请先输入演示主题' });
+    const existingTask = relay.getState().taskId;
+    ensureCurrentTask({ title: prompt, prompt });
+    if (existingTask) appendTaskMessage('user', prompt);
     // 把已上传的文本类素材内容折进生成输入（服务端自己读素材）
     const mat = materials.readMaterialsText();
     const merged = [pastedMaterials, mat.text].filter(Boolean).join('\n\n') || undefined;
-    markdown = await genOutline.generateOutline({ topic, pages, materials: merged });
+    markdown = await genOutline.generateOutline({ topic: prompt, pages, materials: merged });
   }
   const o = normalizeOutline.normalizeOutline({ markdown });
   const version = relay.setDoc({ markdown: o.markdown, title: o.title });
   res.json({ ...o, version });
 }));
 
-// 按主题 + 定稿大纲，逐页流式生成整册 SVG。大纲取自当前权威 doc；每页 setSlide → SSE 'slide' 实时冒页。
+// 按主题 + 定稿大纲逐页生成整册 SVG。请求只创建任务，生成在后台继续，进度经 SSE/状态接口恢复。
 app.post('/api/generate/deck', wrap(async (req, res) => {
   if (!llmprovider.listActive().chat) {
     return res.status(400).json({ error: '尚未配置模型：请打开右上角「模型设置」添加供应商并绑定「文本」默认模型' });
   }
+  if (generationJobs.isActive()) return res.status(409).json({ error: '已有整册生成任务正在运行' });
+
   const { themeId, templateId } = req.body || {};
   const md = relay.getDoc().markdown;
   if (!md || !md.trim()) return res.status(400).json({ error: '还没有内容大纲，请先在阶段1 生成并定稿' });
@@ -480,62 +610,66 @@ app.post('/api/generate/deck', wrap(async (req, res) => {
   const profile = loadProfile(theme.id);
   const { title, sections } = genDeck.splitOutline(md);
   const total = sections.length;
-  // styleModel：模板的视觉语义层规格（分析阶段产出）。缺失时按纯测量画像走旧行为。
+  if (!total) return res.status(400).json({ error: '大纲中没有可生成的页面' });
   const model = profile ? styleModel.loadStyleModel(theme._dir) : null;
   const hints = renderHints(model);
-  // 令牌统一出口：视觉判定的 bg/ink + 模板实测主色，替代原先分散的 spec 覆盖
   const effProfile = profile ? { ...profile, tokens: styleModel.resolveTokens(profile, model, theme.palette && theme.palette.primary) } : null;
   const plan = planDeck({ styleModel: model, sections, profile: effProfile });
   const refLoader = refPageLoader(theme._dir);
+  const wantImages = !!req.body?.images;
 
   genDeck.acquire();
+  let jobStarted = false;
   try {
-    // 生成前先把当前册冻成历史快照——否则下面这行落空册会直接抹掉上一册内容。
-    // 空册/重复内容由 archive 自行跳过，不会堆积垃圾条目。
-    const prev = relay.getState();
-    if (prev.slides && prev.slides.some(Boolean)) {
-      const prevTpl = prev.templateId ? listDescriptors().find((t) => t.id === prev.templateId) : null;
+    ensureCurrentTask({ title, prompt: relay.getDoc().title || title });
+    const currentTask = relay.getState();
+    const taskId = currentTask.taskId;
+    const projectTitle = currentTask.projectTitle || title;
+    const job = generationJobs.start({ title, templateId: theme.id, total }, async (reportProgress) => {
       try {
-        history.archive({ deck: prev, doc: relay.getDoc(), templateName: prevTpl ? (prevTpl.name || prevTpl.id) : null });
-      } catch { /* 归档失败不阻塞生成 */ }
-    }
-    // 先落空册（含 title/templateId/canvas），浏览器据此切到出片步等待逐页冒出
-    relay.setDeck({ title, templateId: theme.id, canvas: theme.canvas, slides: [] });
-    // Fidelity-first: by default封面/章节复刻模板烘焙设计（imageData=null→baked）。
-    // 仅当请求显式开启 images 时，才让文本模型写 art-direction + 每页专属视觉 brief，
-    // 再生成 AI 插画（封面/章节/结尾各配本页立意的画面，共享同一风格锚点）。
-    const wantImages = !!(req.body && req.body.images);
-    let artDirection = null;
-    let briefs = null;
-    if (profile && wantImages) {
-      artDirection = await genDeck.deckArtDirection({ docTitle: title, sections, profile, cacheKey: `${theme.id}::${md}` });
-      briefs = await genDeck.deckImageBriefs({ docTitle: title, sections, cacheKey: `${theme.id}::${md}::briefs` });
-    }
-    const recovered = [];
-    for (let i = 0; i < total; i++) {
-      const s = sections[i];
-      const profilePolicy = spec.imagePolicy || { enabled: wantImages, roles: ['cover', 'section', 'closing'], size: '1024x1024', prompt: artDirection || profile?.imageStyle };
-      const imageData = profile ? await genDeck.generateSlideImage({ role: s.role, index: i, docTitle: title, section: s, policy: profilePolicy, brief: briefs ? briefs[i] : null }) : null;
-      const pagePlan = plan.pages[i];
-      const diag = {};
-      let svg = effProfile ? renderTemplateSlide({ profile: effProfile, templateDir: theme._dir, section: s, role: s.role, index: i, total, imageData, docTitle: title, plan: pagePlan, hints, diag }) : null;
-      if (!svg) {
-        svg = await genDeck.generateSlideSvg({ docTitle: title, section: s, role: s.role, index: i, total, spec, theme, styleModel: model, plan: pagePlan, referenceImages: refLoader(pagePlan) });
-        svg = await genDeck.addGeneratedImage(svg, { role: s.role, index: i, docTitle: title, section: s, policy: spec.imagePolicy });
+        relay.setDeck({ title, projectTitle, taskId, templateId: theme.id, canvas: theme.canvas, slides: [] });
+        history.updateTask(taskId, { deck: relay.getState(), doc: relay.getDoc(), templateName: theme.name || theme.id });
+        let artDirection = null;
+        let briefs = null;
+        if (profile && wantImages) {
+          reportProgress(0, [], '正在分析配图方案');
+          artDirection = await genDeck.deckArtDirection({ docTitle: title, sections, profile, cacheKey: `${theme.id}::${md}` });
+          reportProgress(0, [], '正在规划每页配图');
+          briefs = await genDeck.deckImageBriefs({ docTitle: title, sections, cacheKey: `${theme.id}::${md}::briefs` });
+        }
+        const recovered = [];
+        for (let i = 0; i < total; i++) {
+          const section = sections[i];
+          reportProgress(i, recovered, `正在生成第 ${i + 1} / ${total} 页`);
+          const profilePolicy = spec.imagePolicy || { enabled: wantImages, roles: ['cover', 'section', 'closing'], size: '1024x1024', prompt: artDirection || profile?.imageStyle };
+          const imageData = profile ? await genDeck.generateSlideImage({ role: section.role, index: i, docTitle: title, section, policy: profilePolicy, brief: briefs ? briefs[i] : null }) : null;
+          const pagePlan = plan.pages[i];
+          const diag = {};
+          let svg = effProfile ? renderTemplateSlide({ profile: effProfile, templateDir: theme._dir, section, role: section.role, index: i, total, imageData, docTitle: title, plan: pagePlan, hints, diag }) : null;
+          if (!svg) {
+            svg = await genDeck.generateSlideSvg({ docTitle: title, section, role: section.role, index: i, total, spec, theme, styleModel: model, plan: pagePlan, referenceImages: refLoader(pagePlan) });
+            svg = await genDeck.addGeneratedImage(svg, { role: section.role, index: i, docTitle: title, section, policy: spec.imagePolicy });
+          }
+          const slide = normalize.normalizeSlide({
+            svg, role: section.role, title: section.heading,
+            meta: { familyId: pagePlan.familyId, variantId: pagePlan.variantId, evidence: pagePlan.evidence, referencePageIndexes: pagePlan.referencePageIndexes, styleModelVersion: plan.styleModelVersion, ...(diag.reason ? { capacityOverflow: diag.reason } : {}) },
+          }, i, total);
+          if (slide._recovered) recovered.push(i);
+          relay.setSlide(i, slide, theme.canvas);
+          reportProgress(i + 1, recovered, `已完成 ${i + 1} / ${total} 页`);
+        }
+        return { themeId: theme.id, pages: total, recovered, renderer: profile ? 'template-profile' : 'free-svg', styleScore: profile ? scoreDeck({ profile, slides: relay.getState().slides }) : null };
+      } finally {
+        genDeck.release();
       }
-      const slide = normalize.normalizeSlide({
-        svg, role: s.role, title: s.heading,
-        meta: { familyId: pagePlan.familyId, variantId: pagePlan.variantId, evidence: pagePlan.evidence, referencePageIndexes: pagePlan.referencePageIndexes, styleModelVersion: plan.styleModelVersion, ...(diag.reason ? { capacityOverflow: diag.reason } : {}) },
-      }, i, total);
-      if (slide._recovered) recovered.push(i);
-      relay.setSlide(i, slide, theme.canvas);
-    }
-    res.json({ themeId: theme.id, pages: total, recovered, renderer: profile ? 'template-profile' : 'free-svg', styleScore: profile ? scoreDeck({ profile, slides: relay.getState().slides }) : null });
-  } finally {
-    genDeck.release();
+    });
+    jobStarted = true;
+    res.status(202).json({ job });
+  } catch (error) {
+    if (!jobStarted) genDeck.release();
+    throw error;
   }
 }));
-
 // 单页重生成：按当前大纲第 index 段重画（可带 feedback 修改意见）→ setSlide 覆盖该页。
 app.post('/api/generate/slide', wrap(async (req, res) => {
   if (!llmprovider.listActive().chat) {
@@ -563,6 +697,10 @@ app.post('/api/generate/slide', wrap(async (req, res) => {
 
   genDeck.acquire();
   try {
+    const hadTask = Boolean(relay.getState().taskId);
+    ensureCurrentTask({ title, prompt: title });
+    if (feedback) appendTaskMessage('user', `第 ${idx + 1} 页修改意见：${feedback}`);
+    else if (hadTask) appendTaskMessage('user', `重新生成第 ${idx + 1} 页`);
     // Match the deck's imagery choice on single-slide redraw (fidelity by default).
     const wantImages = !!(req.body && req.body.images);
     let artDirection = null;
@@ -604,13 +742,15 @@ app.get('/api/stream', (req, res) => {
     Connection: 'keep-alive',
     'X-Accel-Buffering': 'no',
   });
-  res.write('retry: 3000\n\n');
-  // 新连接立即得到当前整册（含各页 scene），支持刷新/重连恢复
-  res.write(`event: deck\ndata: ${JSON.stringify(relay.getState())}\n\n`);
-  // 同时回放当前内容大纲，后连接的浏览器也能立即拿到阶段1 的 doc
-  res.write(`event: doc\ndata: ${JSON.stringify(relay.getDoc())}\n\n`);
   const unsubscribe = relay.subscribe(res);
   req.on('close', unsubscribe);
+  res.write('retry: 3000\n\n');
+  // 先订阅再回放快照，避免生成事件恰好发生在快照与订阅之间而丢失。
+  res.write(`event: deck\ndata: ${JSON.stringify(relay.getState())}\n\n`);
+  res.write(`event: doc\ndata: ${JSON.stringify(relay.getDoc())}\n\n`);
+  res.write(`event: history\ndata: ${JSON.stringify(history.list())}\n\n`);
+  const job = generationJobs.get();
+  if (job) res.write(`event: generation\ndata: ${JSON.stringify(job)}\n\n`);
 });
 
 app.post('/api/export', wrap(async (req, res) => {

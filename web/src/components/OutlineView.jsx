@@ -168,7 +168,7 @@ export default function OutlineView({ markdown, version, comments, activeComment
         <div className="empty-art">📝</div>
         <div className="empty-title">还没有内容大纲</div>
         <div className="empty-sub">
-          在左侧输入主题、点「生成大纲」即可开始；生成后选中文字即可批注，攒一批后统一提交
+          在下方输入主题并发送即可开始；生成后选中文字添加批注，再统一提交修改。
         </div>
       </div>
     );

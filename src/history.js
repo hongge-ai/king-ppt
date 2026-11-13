@@ -1,12 +1,12 @@
-// 历史任务：把「一册 deck + 对应大纲」冻结成磁盘上的不可变快照，并支持读回 relay 继续编辑。
+// 历史对话：首次发送提示词时创建一个 task，后续对话与 deck/doc 快照持续更新在同一条记录中。
+// 打开历史任务会恢复其 relay taskId，因此继续编辑不会产生重复历史项。
 //
 // 设计要点：
-//  - 快照不可变。relay 里的 deck 永远是「工作副本」，历史条目只在 archive 时写入一次。
-//    打开历史 = 把快照塞回 relay；之后所有编辑都发生在工作副本上，不会污染历史。
+//  - deck/doc 是任务当前状态；messages.json 保存用户提示词和修改意见，打开后可继续同一任务。
 //  - 图片按内容哈希去重。烘焙底图以 base64 内联在 slide.svg 里，一册正文页只有 2 KB、
 //    封面/章节页却有 1–2 MB，且同模板的章节页底图完全重复。写入时把 data URI 换成
 //    {{blob:<sha1>.<ext>}} 占位并单独存 blob，读回时还原为完整 data URI——导出链路无感知。
-//  - 保留最近 N 册（默认 50），淘汰时回收不再被引用的 blob。
+//  - 保留最近 N 条对话（默认 50），淘汰时回收不再被引用的 blob。
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -24,6 +24,15 @@ function ensureDirs() {
 
 function sha1(buf) {
   return crypto.createHash('sha1').update(buf).digest('hex');
+}
+
+function fingerprintForDeck(deck) {
+  const slides = Array.isArray(deck && deck.slides) ? deck.slides.filter(Boolean) : [];
+  return sha1(JSON.stringify({
+    title: deck && deck.title || '',
+    templateId: deck && deck.templateId || null,
+    svgs: slides.map((slide) => slide.svg || ''),
+  })).slice(0, 16);
 }
 
 function blobPath(hash, ext) {
@@ -85,61 +94,137 @@ function list() {
     if (!m) continue;
     out.push(m);
   }
-  return out.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  const sorted = out.sort((a, b) => {
+    const activityOrder = String(b.updatedAt || b.createdAt).localeCompare(String(a.updatedAt || a.createdAt));
+    return activityOrder || String(b.createdAt).localeCompare(String(a.createdAt));
+  });
+  const seenFingerprints = new Set();
+  return sorted.filter((item) => {
+    if (!item.fingerprint) return true;
+    const legacyDuplicate = item.messageCount === undefined && seenFingerprints.has(item.fingerprint);
+    seenFingerprints.add(item.fingerprint);
+    return !legacyDuplicate;
+  });
 }
 
-// 存档当前 deck。空册跳过；内容与最新一册完全相同也跳过（避免连点生成堆积重复快照）。
-function archive({ deck, doc, templateName }) {
-  const slides = Array.isArray(deck && deck.slides) ? deck.slides.filter(Boolean) : [];
-  if (!slides.length) return { skipped: 'empty' };
-  const fingerprint = sha1(JSON.stringify({
-    title: deck.title || '', templateId: deck.templateId || null,
-    svgs: slides.map((s) => s.svg || ''),
-  })).slice(0, 16);
-  const latest = list()[0];
-  if (latest && latest.fingerprint === fingerprint) return { skipped: 'duplicate', id: latest.id };
+function findByFingerprint(deck) {
+  if (!Array.isArray(deck && deck.slides) || !deck.slides.some(Boolean)) return null;
+  const fingerprint = fingerprintForDeck(deck);
+  return list().find((item) => item.fingerprint === fingerprint) || null;
+}
 
-  ensureDirs();
-  const id = `${stamp()}-${crypto.randomBytes(2).toString('hex')}`;
+function taskDirectory(id) {
+  if (!ID_RE.test(String(id))) {
+    const e = new Error('历史任务 id 非法'); e.code = 'BAD_INPUT'; throw e;
+  }
   const dir = path.join(HISTORY_DIR, id);
-  fs.mkdirSync(dir, { recursive: true });
+  if (!fs.existsSync(path.join(dir, 'meta.json'))) {
+    const e = new Error('历史任务不存在'); e.code = 'SESSION_NOT_FOUND'; throw e;
+  }
+  return dir;
+}
 
+function writeSnapshot(dir, deck, doc) {
+  const slides = Array.isArray(deck && deck.slides) ? deck.slides.filter(Boolean) : [];
   const stored = {
-    title: deck.title || '',
-    templateId: deck.templateId || null,
-    canvas: deck.canvas || null,
+    title: deck && deck.title || '',
+    templateId: deck && deck.templateId || null,
+    canvas: deck && deck.canvas || null,
     slides: mapSlides(slides, externalizeOne),
   };
   fs.writeFileSync(path.join(dir, 'deck.json'), JSON.stringify(stored));
-  if (doc && typeof doc.markdown === 'string' && doc.markdown.trim()) {
-    fs.writeFileSync(path.join(dir, 'doc.md'), doc.markdown, 'utf8');
-  }
+  const docPath = path.join(dir, 'doc.md');
+  if (doc && typeof doc.markdown === 'string' && doc.markdown.trim()) fs.writeFileSync(docPath, doc.markdown, 'utf8');
+  else { try { fs.unlinkSync(docPath); } catch { /* no saved outline */ } }
+  return { stored, slides };
+}
 
+function writeMeta(dir, meta) {
+  const metaPath = path.join(dir, 'meta.json');
+  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+  try {
+    meta.bytes = fs.readdirSync(dir).reduce((n, file) => n + fs.statSync(path.join(dir, file)).size, 0);
+    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
+  } catch { /* storage size is informational */ }
+}
+
+function createTask({ title, prompt, deck = {}, doc = null, templateName = '' }) {
+  ensureDirs();
+  let id;
+  let dir;
+  do {
+    id = `${stamp()}-${crypto.randomBytes(2).toString('hex')}`;
+    dir = path.join(HISTORY_DIR, id);
+  } while (fs.existsSync(dir));
+  fs.mkdirSync(dir, { recursive: true });
+  const now = new Date().toISOString();
+  const promptText = String(prompt || '').trim();
+  const cleanTitle = String(title || promptText || deck.projectTitle || deck.title || '新对话').trim().slice(0, 80) || '新对话';
+  const messages = promptText ? [{ role: 'user', content: promptText, createdAt: now }] : [];
+  const { stored, slides } = writeSnapshot(dir, deck, doc);
+  fs.writeFileSync(path.join(dir, 'messages.json'), JSON.stringify(messages, null, 2), 'utf8');
   const meta = {
     id,
-    title: stored.title || '未命名',
-    createdAt: new Date().toISOString(),
-    pages: stored.slides.length,
+    title: cleanTitle,
+    prompt: promptText,
+    createdAt: now,
+    updatedAt: now,
+    pages: slides.length,
     templateId: stored.templateId,
     templateName: templateName || stored.templateId || '',
     canvas: stored.canvas,
-    fingerprint,
     hasDoc: Boolean(doc && doc.markdown && doc.markdown.trim()),
+    messageCount: messages.length,
+    fingerprint: fingerprintForDeck(deck),
     bytes: 0,
   };
-  fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 2));
-  // 体积按落盘后实测回填，列表页据此展示
-  try {
-    const size = fs.readdirSync(dir).reduce((n, f) => n + fs.statSync(path.join(dir, f)).size, 0);
-    meta.bytes = size;
-    fs.writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(meta, null, 2));
-  } catch { /* 体积只是展示信息 */ }
-
+  writeMeta(dir, meta);
   prune();
-  return { id, pages: meta.pages };
+  return meta;
 }
 
-// 读回一册（图片已还原成 data URI）：{ meta, deck, doc }
+function updateTask(id, { deck = {}, doc = null, templateName } = {}) {
+  const dir = taskDirectory(id);
+  const meta = readMeta(id);
+  const { stored, slides } = writeSnapshot(dir, deck, doc);
+  meta.pages = slides.length;
+  meta.templateId = stored.templateId;
+  meta.templateName = templateName || meta.templateName || stored.templateId || '';
+  meta.canvas = stored.canvas;
+  meta.hasDoc = Boolean(doc && doc.markdown && doc.markdown.trim());
+  meta.fingerprint = slides.length ? fingerprintForDeck(deck) : '';
+  meta.updatedAt = new Date().toISOString();
+  writeMeta(dir, meta);
+  prune();
+  return meta;
+}
+
+function messagesFor(id) {
+  const file = path.join(taskDirectory(id), 'messages.json');
+  try {
+    const value = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return Array.isArray(value) ? value : [];
+  } catch { return []; }
+}
+
+function appendMessage(id, { role = 'user', content } = {}) {
+  const dir = taskDirectory(id);
+  const text = String(content || '').trim();
+  if (!text) return null;
+  if (!['user', 'assistant', 'system'].includes(role)) {
+    const e = new Error('消息角色非法'); e.code = 'BAD_INPUT'; throw e;
+  }
+  const messages = messagesFor(id);
+  const message = { role, content: text, createdAt: new Date().toISOString() };
+  messages.push(message);
+  fs.writeFileSync(path.join(dir, 'messages.json'), JSON.stringify(messages, null, 2), 'utf8');
+  const meta = readMeta(id);
+  meta.messageCount = messages.length;
+  meta.updatedAt = message.createdAt;
+  writeMeta(dir, meta);
+  return message;
+}
+// 读回一个对话任务（图片还原为 data URI，并返回对话消息）。
 function load(id) {
   if (!ID_RE.test(String(id))) {
     const e = new Error('历史条目 id 非法'); e.code = 'BAD_INPUT'; throw e;
@@ -155,8 +240,9 @@ function load(id) {
   try { markdown = fs.readFileSync(path.join(dir, 'doc.md'), 'utf8'); } catch { /* 无大纲快照 */ }
   return {
     meta,
-    deck: { title: stored.title || '', templateId: stored.templateId || null, canvas: stored.canvas || null, slides: mapSlides(stored.slides, inflateOne) },
+    deck: { title: stored.title || '', projectTitle: meta.title || stored.title || '', taskId: meta.id, templateId: stored.templateId || null, canvas: stored.canvas || null, slides: mapSlides(stored.slides, inflateOne) },
     doc: markdown ? { markdown, title: stored.title || '' } : null,
+    messages: messagesFor(id),
   };
 }
 
@@ -165,7 +251,6 @@ function rename(id, title) {
     const e = new Error('历史条目 id 非法'); e.code = 'BAD_INPUT'; throw e;
   }
   const dir = path.join(HISTORY_DIR, id);
-  const metaPath = path.join(dir, 'meta.json');
   const meta = readMeta(id);
   if (!meta) {
     const e = new Error('历史条目不存在'); e.code = 'SESSION_NOT_FOUND'; throw e;
@@ -178,11 +263,8 @@ function rename(id, title) {
     const e = new Error('标题不能超过 80 个字符'); e.code = 'BAD_INPUT'; throw e;
   }
   meta.title = nextTitle;
-  fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
-  try {
-    meta.bytes = fs.readdirSync(dir).reduce((n, file) => n + fs.statSync(path.join(dir, file)).size, 0);
-    fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2), 'utf8');
-  } catch { /* 体积只是展示信息 */ }
+  meta.updatedAt = new Date().toISOString();
+  writeMeta(dir, meta);
   return meta;
 }
 
@@ -234,4 +316,4 @@ function collectOrphanBlobs() {
   }
 }
 
-module.exports = { list, archive, load, rename, remove, HISTORY_DIR, KEEP };
+module.exports = { list, findByFingerprint, createTask, updateTask, appendMessage, messagesFor, load, rename, remove, HISTORY_DIR, KEEP };

@@ -19,6 +19,8 @@ async function req(path, { method = 'GET', body, raw = false } = {}) {
 export const api = {
   listThemes: () => req('/api/templates'),
   themeSpec: (id) => req(`/api/templates/${encodeURIComponent(id)}/spec`),
+  templatePreview: (id) => req(`/api/templates/${encodeURIComponent(id)}/preview?summary=1`),
+  templatePreviewImage: (id, index) => `/api/templates/${encodeURIComponent(id)}/preview-image/${index}`,
   // 上传模板：先提取+烘焙为暂存（base64），再落库为可复用模板；删除用于本地维护
   extractTemplate: (name, data) => req('/api/templates/extract', { method: 'POST', body: { name, data } }),
   saveTemplate: (stagingId, name) => req('/api/templates', { method: 'POST', body: { stagingId, name } }),
@@ -26,11 +28,11 @@ export const api = {
   // 多模态长任务，上传保存后触发一次，后续生成与验收共用这份规格。
   analyzeTemplate: (id) => req(`/api/templates/${encodeURIComponent(id)}/analyze`, { method: 'POST', body: {} }),
   deleteTheme: (id) => req(`/api/templates/${encodeURIComponent(id)}`, { method: 'DELETE' }),
-  // 历史任务：一册 deck + 大纲的不可变快照。打开 = 塞回服务端 relay，之后编辑作用于工作副本。
+  // 历史对话任务：首次提示词创建任务，后续 deck/doc 与消息始终更新到同一记录。
   history: () => req('/api/history'),
   newPresentation: () => req('/api/new', { method: 'POST', body: {} }),
-  archiveHistory: () => req('/api/history/archive', { method: 'POST', body: {} }),
   openHistory: (id) => req(`/api/history/${encodeURIComponent(id)}/open`, { method: 'POST', body: {} }),
+  historyMessages: (id) => req(`/api/history/${encodeURIComponent(id)}/messages`),
   renameHistory: (id, title) => req(`/api/history/${encodeURIComponent(id)}`, { method: 'PATCH', body: { title } }),
   deleteHistory: (id) => req(`/api/history/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   // 演示态快照（刷新/重连恢复）：deck=整册幻灯片，doc=内容大纲
@@ -57,26 +59,29 @@ export const api = {
     req('/api/generate/outline', { method: 'POST', body: { topic, pages, materials } }),
   reviseOutline: (comments) =>
     req('/api/generate/outline', { method: 'POST', body: { comments } }),
-  // 阶段2：按主题 + 定稿大纲，服务端逐页流式生成整册（结果经 SSE 'deck'/'slide' 实时回来）
+  // 阶段2：快速创建后台整册生成任务；SSE 与 status 接口提供进度、完成和失败状态。
   // images=true 时封面/章节用 AI 生成插画；默认 false = 复刻模板原图（忠于模板）
   generateDeck: (themeId, images = false) =>
     req('/api/generate/deck', { method: 'POST', body: { themeId, images } }),
+  generationStatus: () => req('/api/generate/deck/status'),
   // 单页重生成（可带修改意见 feedback）
   regenSlide: (index, feedback, images = false) =>
     req('/api/generate/slide', { method: 'POST', body: { index, feedback, images } }),
   // 导出当前 deck 为 .pptx（返回 Blob）
-  async export(slides, title, themeId) {
-    const resp = await req('/api/export', { method: 'POST', raw: true, body: { slides, title, themeId } });
+  async export(slides, title, themeId, canvas) {
+    const resp = await req('/api/export', { method: 'POST', raw: true, body: { slides, title, themeId, canvas } });
     return resp.blob();
   },
 };
 
 // SSE 订阅：deck（整册）/ slide（单页）/ doc（内容大纲）。返回取消函数。自动重连由浏览器按 retry 处理。
-export function subscribe({ onDeck, onSlide, onDoc, onError }) {
+export function subscribe({ onDeck, onSlide, onDoc, onGeneration, onHistory, onError }) {
   const es = new EventSource('/api/stream');
   es.addEventListener('deck', (e) => { try { onDeck(JSON.parse(e.data)); } catch { /* 忽略坏帧 */ } });
   es.addEventListener('slide', (e) => { try { onSlide(JSON.parse(e.data)); } catch { /* 忽略坏帧 */ } });
   if (onDoc) es.addEventListener('doc', (e) => { try { onDoc(JSON.parse(e.data)); } catch { /* 忽略坏帧 */ } });
+  if (onGeneration) es.addEventListener('generation', (e) => { try { onGeneration(JSON.parse(e.data)); } catch { /* 忽略坏帧 */ } });
+  if (onHistory) es.addEventListener('history', (e) => { try { onHistory(JSON.parse(e.data)); } catch { /* 忽略坏帧 */ } });
   es.onerror = () => { if (onError) onError(); };
   return () => es.close();
 }

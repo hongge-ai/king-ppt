@@ -20,15 +20,15 @@ node bin/cli.js serve        # 启动服务 + 开浏览器（默认 http://local
 
 ## 聊天式创作流程
 
-左侧栏直接显示当前项目和全部历史演示文稿，可打开、重命名或删除历史条目。新建时，当前已生成的幻灯片会先保存到历史记录；未出片的大纲会提示后再清空。
+左侧栏按对话/任务显示历史。点击“新建”只创建空白工作区；发送第一条提示词时才建立历史任务。同一任务后续的大纲修改、出片和页面编辑都会更新到这条记录，可重命名、重新打开并继续编辑。
 
 ```
 输入主题 → 对话式检查大纲 → 选择模板 → 实时预览与编辑 → 导出 PPTX
 ```
 
 1. **内容大纲**：在聊天输入框写主题（可添加 pdf/docx/md/txt/图片素材作参考）→ 生成结构化 Markdown 大纲 → 在大纲中**划词批注**、攒一批提交改稿 → 满意后**定稿**。
-2. **选择模板**：浏览可选主题风格，点任意模板打开**预览弹层**（渲染该主题的封面/章节/内容/结束 4 张原型页）→「用此模板生成」。
-3. **幻灯片**：服务端按【定稿大纲 + 所选主题】**逐页流式生成** SVG，页面逐张实时冒出。可点文字**就地编辑**、对某页提意见**AI 重画**或直接**重画本页**。最后「导出 PPTX」，在 PowerPoint / WPS 里继续编辑。
+2. **选择模板**：浏览可选主题风格，上传模板会在**预览弹层**显示原始 PPT 的封面、章节、内容和结束代表页；没有原始文件时才显示生成样例 →「用此模板生成」。
+3. **幻灯片**：服务端以后台任务按【定稿大纲 + 所选主题】逐页生成 SVG，页面逐张实时冒出；可离开或刷新页面，任务仍会继续，重新打开后可恢复进度。失败时会保留已完成页并显示错误。可点文字**就地编辑**、对某页提意见**AI 重画**或直接**重画本页**。最后「导出 PPTX」，在 PowerPoint / WPS 里继续编辑。
 
 ## HTTP 接口一览
 
@@ -40,14 +40,16 @@ node bin/cli.js serve        # 启动服务 + 开浏览器（默认 http://local
 | `POST /api/templates/extract` · `POST /api/templates` | 上传 .pptx 提取为可复用主题 |
 | `GET /api/providers` · `POST /api/instances*` · `POST /api/active` | 多供应商 × 多模型 × 能力绑定的配置读写 |
 | `POST /api/generate/outline` | 生成 / 按批注改稿内容大纲（→ SSE `doc`） |
-| `POST /api/generate/deck` | 按 `{themeId}` + 定稿大纲逐页流式生成整册（→ SSE `slide`） |
+| `POST /api/generate/deck` | 快速创建后台整册生成任务（202，逐页结果经 SSE `slide`） |
+| `GET /api/generate/deck/status` | 查询当前任务状态、进度、失败原因或服务重启中断状态 |
 | `POST /api/generate/slide` | 单页重生成 `{index, feedback?}` |
-| `POST /api/new` | 存档当前演示文稿并创建空白创作会话 |
-| `PATCH /api/history/:id` | 修改历史演示文稿的显示标题 |
+| `POST /api/new` | 创建空白对话工作区，不新增历史任务 |
+| `GET /api/history/:id/messages` | 读取该对话任务的提示词与修改意见 |
+| `PATCH /api/history/:id` | 修改历史对话任务的显示标题 |
 | `POST /api/deck/slide` | 就地编辑落库 `{index, svg}` |
 | `GET /api/deck` · `GET /api/doc` | 演示态 / 大纲快照（刷新/重连恢复） |
 | `GET /api/deck/style-score` | 当前整册风格评分（配色、字体、角色几何、图片槽位、正文一致性） |
-| `GET /api/stream` | SSE：推 `deck` / `slide` / `doc` 事件 |
+| `GET /api/stream` | SSE：推 `deck` / `slide` / `doc` / `generation` / `history` 事件 |
 | `POST /api/export` | 导出当前演示态为 .pptx |
 
 ## CLI
@@ -59,6 +61,13 @@ king-ppt export <out.pptx>              导出当前演示态为 .pptx
 ```
 
 生成大纲 / 选模板 / 编辑等均在浏览器里完成。CLI 经 `KING_PPT_HOME/server.json` 定位服务（或 `--port=N` / `KING_PPT_PORT`）。
+
+## 验证
+
+```bash
+npm test
+npm run build
+```
 
 ## 模板系统
 

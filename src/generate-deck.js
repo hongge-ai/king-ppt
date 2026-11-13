@@ -31,6 +31,7 @@ function acquire() {
   inflight = true;
 }
 function release() { inflight = false; }
+function isBusy() { return inflight; }
 
 function imageEnabledFor(policy, role, index) {
   if (!policy || policy.enabled === false) return false;
@@ -431,4 +432,4 @@ async function generateSlideSvg({ docTitle, section, role, index, total, spec, t
     : llm.chat([{ role: 'system', content: system }, { role: 'user', content: user }], { temperature: 0.6, maxTokens: 6000 }));
   return llm.extractSvg(text);
 }
-module.exports = { splitOutline, generateSlideSvg, addGeneratedImage, generateSlideImage, deckArtDirection, deckImageBriefs, acquire, release };
+module.exports = { splitOutline, generateSlideSvg, addGeneratedImage, generateSlideImage, deckArtDirection, deckImageBriefs, acquire, release, isBusy };

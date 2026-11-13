@@ -27,9 +27,25 @@ function swatchOf(t) {
   return `linear-gradient(135deg, ${c('primary', c('ink', '1F4E79'))} 0%, ${c('accent', c('muted', '2E86C1'))} 100%)`;
 }
 
+function relativeTime(value) {
+  const timestamp = Date.parse(value || '');
+  if (!Number.isFinite(timestamp)) return '';
+  const minutes = Math.max(0, Math.floor((Date.now() - timestamp) / 60000));
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes}分钟`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}小时`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}天`;
+  const date = new Date(timestamp);
+  return `${date.getMonth() + 1}月${date.getDate()}日`;
+}
+
 export default function App() {
   const [step, setStep] = useState('outline'); // 'outline' | 'theme' | 'slides'
-  const [deck, setDeck] = useState({ title: '', themeId: null, slides: [], version: 0 });
+  const [deck, setDeck] = useState({ title: '', projectTitle: '', themeId: null, canvas: null, slides: [], version: 0 });
+  const [generationJob, setGenerationJob] = useState(null);
+  const generationJobRef = useRef(null);
   const [styleScore, setStyleScore] = useState(null);
   const [doc, setDocState] = useState({ markdown: '', title: '', version: 0 });
   const [outlineComments, setOutlineComments] = useState([]);
@@ -47,12 +63,14 @@ export default function App() {
   const [showSettings, setShowSettings] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [historyItems, setHistoryItems] = useState([]);
+  const [taskMessages, setTaskMessages] = useState([]);
   const [editingHistoryId, setEditingHistoryId] = useState(null);
   const [editingHistoryTitle, setEditingHistoryTitle] = useState('');
   const [historyBusyId, setHistoryBusyId] = useState(null);
   const [topic, setTopic] = useState('');       // 阶段1 主题输入
   const deckVersionRef = useRef(0);
   const docVersionRef = useRef(0);
+  const taskIdRef = useRef(null);
   const tplInputRef = useRef(null); // 隐藏的 .pptx 文件选择器
   const initedRef = useRef(false); // 是否已按首份快照设过初始步骤（之后以用户操作为准）
   const dialog = useAppDialog();
@@ -69,16 +87,26 @@ export default function App() {
     } catch { /* 历史列表不可用时不阻断创作 */ }
   }, []);
 
-  const onArchiveCurrent = useCallback(async () => {
-    if (!deck.slides.some(Boolean) || busy) return;
-    try {
-      const r = await api.archiveHistory();
-      if (r.skipped === 'duplicate') flash('当前内容已在历史记录中', 'info');
-      else if (r.skipped === 'empty') flash('当前没有可存档的幻灯片', 'error');
-      else flash('已存入历史演示文稿', 'ok');
+  const applyGenerationJob = useCallback((job, { notify = true } = {}) => {
+    if (!job) return;
+    const previous = generationJobRef.current;
+    if (previous && previous.id === job.id && (previous.revision || 0) > (job.revision || 0)) return;
+    generationJobRef.current = job;
+    setGenerationJob(job);
+    const active = job.status === 'queued' || job.status === 'running';
+    setBusy(active);
+    if (active) setStep('slides');
+    const changedTerminal = ['completed', 'failed', 'interrupted'].includes(job.status)
+      && (!previous || previous.id !== job.id || previous.status !== job.status);
+    if (changedTerminal && notify) {
+      if (job.status === 'completed') {
+        flash(job.recovered && job.recovered.length ? `生成完成，其中 ${job.recovered.length} 页需重画` : '生成完成', 'ok');
+      } else {
+        flash(`生成未完成：${job.error || '任务中断'}`, 'error');
+      }
       refreshHistory();
-    } catch (e) { flash(`存档失败：${e.message}`, 'error'); }
-  }, [deck.slides, busy, flash, refreshHistory]);
+    }
+  }, [flash, refreshHistory]);
 
   const onRenameHistory = useCallback(async (event, id) => {
     event.preventDefault();
@@ -97,8 +125,8 @@ export default function App() {
 
   const onDeleteHistory = useCallback(async (item) => {
     const ok = await dialog.ask({
-      title: '删除历史演示文稿？',
-      body: `将永久删除「${item.title || '未命名演示文稿'}」，此操作无法撤销。`,
+      title: '删除历史对话？',
+      body: `将永久删除「${item.title || '未命名对话'}」，此操作无法撤销。`,
       okText: '删除',
     });
     if (!ok) return;
@@ -106,20 +134,24 @@ export default function App() {
     try {
       const r = await api.deleteHistory(item.id);
       setHistoryItems(Array.isArray(r.items) ? r.items : []);
-      flash('历史演示文稿已删除', 'ok');
+      if (item.id === deck.taskId) { setTaskMessages([]); setTopic(''); setOutlineComments([]); setActiveCommentId(null); }
+      flash('历史对话已删除', 'ok');
     } catch (e) { flash(`删除失败：${e.message}`, 'error'); }
     finally { setHistoryBusyId(null); }
-  }, [dialog, flash]);
+  }, [dialog, flash, deck.taskId]);
 
   // 初始化：拉主题列表 + 供应商配置 + 当前 deck / doc 快照（刷新/重连恢复）
   useEffect(() => {
     api.listThemes().then((r) => setThemes(r.templates || [])).catch(() => {});
     api.getProviders().then(setProviders).catch(() => {});
     refreshHistory();
+    api.generationStatus().then((r) => applyGenerationJob(r.job, { notify: false })).catch(() => {});
     api.deck().then((st) => {
       if (st && Array.isArray(st.slides)) {
         deckVersionRef.current = st.version || 0;
-        setDeck({ title: st.title || '', themeId: st.templateId || null, slides: st.slides, version: st.version || 0 });
+        taskIdRef.current = st.taskId || null;
+        setDeck({ title: st.title || '', projectTitle: st.projectTitle || st.title || '', taskId: st.taskId || null, themeId: st.templateId || null, canvas: st.canvas || null, slides: st.slides, version: st.version || 0 });
+        if (st.taskId) api.historyMessages(st.taskId).then((r) => setTaskMessages(r.messages || [])).catch(() => {});
         if (st.templateId) setSelectedThemeId(st.templateId);
         // 恢复初始步骤：已有幻灯片 → 出片步；否则留在大纲步
         if (!initedRef.current && st.slides.filter(Boolean).length > 0) { initedRef.current = true; setStep('slides'); }
@@ -133,7 +165,7 @@ export default function App() {
         setTopic(d.title || '');
       }
     }).catch(() => {});
-  }, [refreshHistory]);
+  }, [refreshHistory, applyGenerationJob]);
 
   // SSE 订阅：整册替换 / 单页写入 / 大纲替换。丢弃过期版本回放（version 单调）。
   useEffect(() => {
@@ -142,9 +174,18 @@ export default function App() {
         if (data.version && data.version < deckVersionRef.current) return;
         deckVersionRef.current = data.version || deckVersionRef.current;
         setConnected(true);
+        const nextTaskId = data.taskId || null;
+        if (nextTaskId !== taskIdRef.current) {
+          taskIdRef.current = nextTaskId;
+          if (nextTaskId) api.historyMessages(nextTaskId).then((r) => setTaskMessages(r.messages || [])).catch(() => {});
+          else setTaskMessages([]);
+        }
         setDeck({
           title: data.title || '',
+          projectTitle: data.projectTitle || data.title || '',
+          taskId: data.taskId || null,
           themeId: data.templateId || null,
+          canvas: data.canvas || null,
           slides: Array.isArray(data.slides) ? data.slides : [],
           version: data.version || 0,
         });
@@ -169,16 +210,23 @@ export default function App() {
         // 大纲更新（改稿重推）：清空本地批注与选中，旧高亮随 key 重挂丢弃
         if (changed) { setOutlineComments([]); setActiveCommentId(null); }
       },
+      onGeneration: (job) => { setConnected(true); applyGenerationJob(job); },
+      onHistory: (items) => setHistoryItems(Array.isArray(items) ? items : []),
       onError: () => setConnected(false),
     });
     return unsub;
-  }, []);
+  }, [applyGenerationJob]);
 
   const slides = deck.slides.filter(Boolean);
   const hasSlides = slides.length > 0;
   const hasDoc = !!doc.markdown;
   const hasModel = !!providers?.active?.chat; // 已绑定文本默认模型才能生成
   const activeThemeId = selectedThemeId || deck.themeId;
+  const currentGenerationJob = generationJob && generationJob.title === deck.title ? generationJob : null;
+
+  useEffect(() => {
+    if (currentGenerationJob && ['failed', 'interrupted'].includes(currentGenerationJob.status)) setStep('slides');
+  }, [currentGenerationJob && currentGenerationJob.id, currentGenerationJob && currentGenerationJob.status]);
 
   // Re-score after each streamed page. The score is computed from the same SVG
   // payload used by preview/export, so the badge reflects the current deck.
@@ -200,6 +248,7 @@ export default function App() {
   // 按意见重画当前页
   const onAnnotate = useCallback((instruction, index) => {
     if (!(index >= 0)) { flash('请先选中要修改的页', 'error'); return; }
+    setTaskMessages((prev) => [...prev, { role: 'user', content: `第 ${index + 1} 页修改意见：${instruction}`, createdAt: new Date().toISOString() }]);
     setBusy(true);
     api.regenSlide(index, instruction, aiImages)
       .then(() => flash(`已按意见重画第 ${index + 1} 页`, 'ok'))
@@ -209,6 +258,7 @@ export default function App() {
 
   // 重画当前页（无修改意见）
   const onRegenerate = useCallback((index) => {
+    setTaskMessages((prev) => [...prev, { role: 'user', content: `重新生成第 ${index + 1} 页`, createdAt: new Date().toISOString() }]);
     setBusy(true);
     api.regenSlide(index, undefined, aiImages)
       .then(() => flash(`已重画第 ${index + 1} 页`, 'ok'))
@@ -280,7 +330,9 @@ export default function App() {
       setStep(r.pages > 0 ? 'slides' : 'outline');
       setActiveIndex(0);
       setSelectedThemeId(r.meta && r.meta.templateId ? r.meta.templateId : '');
-      setTopic(r.meta && r.meta.title ? r.meta.title : '');
+      setTopic(r.deckTitle || (r.meta && r.meta.title) || '');
+      taskIdRef.current = r.meta.id;
+      setTaskMessages(Array.isArray(r.messages) ? r.messages : []);
       setSidebarOpen(false);
       flash(`已打开「${item.title}」`, 'ok');
       refreshHistory();
@@ -294,9 +346,7 @@ export default function App() {
     if (hasSlides || hasDoc) {
       const ok = await dialog.ask({
         title: '新建演示文稿？',
-        body: hasSlides
-          ? '当前幻灯片会先保存到历史记录。尚未出片的大纲不会单独保留。'
-          : '当前大纲尚未生成幻灯片，开始新建后会清空。',
+        body: '当前对话和演示文稿已自动保存在历史列表。新建后会开始一条空白对话。',
         okText: '新建',
       });
       if (!ok) return;
@@ -307,7 +357,11 @@ export default function App() {
       deckVersionRef.current = r.deckVersion || 0;
       docVersionRef.current = r.docVersion || 0;
       initedRef.current = true;
-      setDeck({ title: '', themeId: null, slides: [], version: r.deckVersion || 0 });
+      setDeck({ title: '', projectTitle: '', taskId: null, themeId: null, canvas: null, slides: [], version: r.deckVersion || 0 });
+      taskIdRef.current = null;
+      setTaskMessages([]);
+      setGenerationJob(null);
+      generationJobRef.current = null;
       setDocState({ markdown: '', title: '', version: r.docVersion || 0 });
       setHistoryItems(Array.isArray(r.history) ? r.history : []);
       setSelectedThemeId('');
@@ -331,12 +385,14 @@ export default function App() {
     setStep('slides');
     setActiveIndex(0);
     setBusy(true);
-    flash(aiImages ? '正在按模板逐页生成（含 AI 配图）…' : '正在按模板逐页生成…', 'ok');
+    setGenerationJob(null);
+    generationJobRef.current = null;
+    flash(aiImages ? '已开始逐页生成（含 AI 配图），可离开页面后再回来查看进度' : '已开始逐页生成，可离开页面后再回来查看进度', 'ok');
     api.generateDeck(themeId, aiImages)
-      .then((r) => flash(r.recovered?.length ? `生成完成，其中 ${r.recovered.length} 页需重画` : '生成完成', 'ok'))
-      .catch((e) => flash(`生成失败：${e.message}`, 'error'))
-      .finally(() => { setBusy(false); refreshHistory(); });
-  }, [hasModel, flash, aiImages, refreshHistory]);
+      .then((r) => applyGenerationJob(r.job))
+      .catch((e) => { setBusy(false); flash(`启动生成失败：${e.message}`, 'error'); })
+      .finally(refreshHistory);
+  }, [hasModel, flash, aiImages, refreshHistory, applyGenerationJob]);
 
   // ---------- 阶段1：内容大纲 ----------
   const onAddComment = useCallback((c) => setOutlineComments((prev) => [...prev, c]), []);
@@ -348,22 +404,26 @@ export default function App() {
 
   // 按主题让服务端生成大纲（结果经 SSE 'doc' 回来）
   const onGenerateOutline = useCallback(() => {
-    if (!topic.trim()) return;
+    const prompt = topic.trim();
+    if (!prompt) return;
+    setTaskMessages((prev) => [...prev, { role: 'user', content: prompt, createdAt: new Date().toISOString() }]);
     setBusy(true);
-    api.generateOutline({ topic: topic.trim() })
+    api.generateOutline({ topic: prompt })
       .then(() => flash('大纲已生成', 'ok'))
       .catch((e) => flash(`生成失败：${e.message}`, 'error'))
-      .finally(() => setBusy(false));
-  }, [topic, flash]);
+      .finally(() => { setBusy(false); refreshHistory(); });
+  }, [topic, flash, refreshHistory]);
 
   const onSendBatch = useCallback(() => {
     if (outlineComments.length === 0) return;
+    const message = outlineComments.map((c) => `引用：${c.quote}\n修改：${c.comment}`).join('\n\n');
+    setTaskMessages((prev) => [...prev, { role: 'user', content: message, createdAt: new Date().toISOString() }]);
     setBusy(true);
     api.reviseOutline(outlineComments)
       .then(() => { setOutlineComments([]); setActiveCommentId(null); flash('正在按批注改稿…', 'ok'); })
       .catch((e) => flash(`发送失败：${e.message}`, 'error'))
-      .finally(() => setBusy(false));
-  }, [outlineComments, flash]);
+      .finally(() => { setBusy(false); refreshHistory(); });
+  }, [outlineComments, flash, refreshHistory]);
 
   const onFinalize = useCallback(async () => {
     const ok = await dialog.ask({
@@ -394,7 +454,7 @@ export default function App() {
     if (!hasSlides) return;
     setBusy(true);
     try {
-      const blob = await api.export(deck.slides, deck.title, deck.themeId);
+      const blob = await api.export(deck.slides, deck.title, deck.themeId, deck.canvas);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -450,21 +510,11 @@ export default function App() {
         <button className="new-chat-btn" disabled={busy} onClick={onNewPresentation}>
           <span aria-hidden="true">＋</span>新建演示文稿
         </button>
-        <div className="sidebar-section-label">当前项目</div>
-        {hasSlides || hasDoc ? (
-          <button className="sidebar-history-item current" onClick={() => { setStep(hasSlides ? 'slides' : 'outline'); setActiveIndex(0); setSidebarOpen(false); }}>
-            <span className="sidebar-history-mark">▧</span>
-            <span className="sidebar-history-copy">
-              <span className="sidebar-history-title">{deck.title || doc.title || '未命名演示文稿'}</span>
-              <span className="sidebar-history-meta">{hasSlides ? `${slides.length} 页 · 当前项目` : '大纲草稿'}</span>
-            </span>
-          </button>
-        ) : <div className="sidebar-current-empty">还没有打开的演示文稿</div>}
         <div className="sidebar-section-label history-section-label">
-          <span>历史演示文稿</span>
+          <span>历史对话</span>
           <span className="sidebar-history-count">{historyItems.length}</span>
         </div>
-        <nav className="sidebar-history" aria-label="历史演示文稿">
+        <nav className="sidebar-history" aria-label="历史对话">
           {historyItems.map((item) => (
             <div key={item.id} className="sidebar-history-entry">
               {editingHistoryId === item.id ? (
@@ -472,7 +522,7 @@ export default function App() {
                   <input
                     autoFocus
                     maxLength={80}
-                    aria-label="历史演示文稿标题"
+                    aria-label="历史对话标题"
                     value={editingHistoryTitle}
                     disabled={historyBusyId === item.id}
                     onChange={(e) => setEditingHistoryTitle(e.target.value)}
@@ -485,29 +535,30 @@ export default function App() {
                 </form>
               ) : (
                 <>
-                  <button className="sidebar-history-item" disabled={busy || historyBusyId !== null} onClick={() => onOpenHistory(item)}>
-                    <span className="sidebar-history-mark">▤</span>
+                  <button className={`sidebar-history-item${item.id === deck.taskId ? ' current' : ''}`} aria-current={item.id === deck.taskId ? 'page' : undefined} disabled={busy || historyBusyId !== null} onClick={() => {
+                    if (item.id === deck.taskId) { setStep(hasSlides ? 'slides' : 'outline'); setSidebarOpen(false); }
+                    else onOpenHistory(item);
+                  }}>
+                    <span className="sidebar-history-mark">{item.id === deck.taskId ? '▧' : '▤'}</span>
                     <span className="sidebar-history-copy">
-                      <span className="sidebar-history-title">{item.title || '未命名演示文稿'}</span>
-                      <span className="sidebar-history-meta">{item.pages || 0} 页 · {item.templateName || '历史项目'}</span>
+                      <span className="sidebar-history-line">
+                        <span className="sidebar-history-title">{item.title || '未命名对话'}</span>
+                        <time className="sidebar-history-time" dateTime={item.updatedAt || item.createdAt}>{relativeTime(item.updatedAt || item.createdAt)}</time>
+                      </span>
+                      <span className="sidebar-history-meta">{item.id === deck.taskId ? `${slides.length} 页 · 当前对话` : `${item.pages || 0} 页 · ${item.templateName || '历史对话'}`}</span>
                     </span>
                   </button>
                   <div className="sidebar-history-actions">
-                    <button className="sidebar-history-action" disabled={historyBusyId !== null} title="重命名" aria-label={`重命名 ${item.title || '历史演示文稿'}`} onClick={() => { setEditingHistoryId(item.id); setEditingHistoryTitle(item.title || ''); }}>✎</button>
-                    <button className="sidebar-history-action danger" disabled={historyBusyId !== null} title="删除" aria-label={`删除 ${item.title || '历史演示文稿'}`} onClick={() => onDeleteHistory(item)}>×</button>
+                    <button className="sidebar-history-action" disabled={historyBusyId !== null} title="重命名" aria-label={`重命名 ${item.title || '历史对话'}`} onClick={() => { setEditingHistoryId(item.id); setEditingHistoryTitle(item.title || ''); }}>✎</button>
+                    <button className="sidebar-history-action danger" disabled={historyBusyId !== null} title="删除" aria-label={`删除 ${item.title || '历史对话'}`} onClick={() => onDeleteHistory(item)}>×</button>
                   </div>
                 </>
               )}
             </div>
           ))}
-          {historyItems.length === 0 ? <div className="sidebar-history-empty">还没有历史演示文稿</div> : null}
+          {historyItems.length === 0 ? <div className="sidebar-history-empty">发送第一条提示词后，对话会显示在这里</div> : null}
         </nav>
         <div className="sidebar-footer">
-          {hasSlides ? (
-            <button className="sidebar-action" disabled={busy} onClick={onArchiveCurrent}>
-              <span aria-hidden="true">▣</span><span>存档当前</span>
-            </button>
-          ) : null}
           <button className="sidebar-action" onClick={() => setShowSettings(true)}>
             <span aria-hidden="true">⚙</span><span>模型设置</span>
           </button>
@@ -520,7 +571,7 @@ export default function App() {
       {sidebarOpen ? <button className="sidebar-backdrop" aria-label="关闭侧栏" onClick={() => setSidebarOpen(false)} /> : null}
       <div className="app-main">
         <header className="topbar">
-          <button className="mobile-sidebar-toggle icon-btn" title="显示历史演示文稿" aria-label="显示历史演示文稿" onClick={() => setSidebarOpen(true)}>☰</button>
+          <button className="mobile-sidebar-toggle icon-btn" title="显示历史对话" aria-label="显示历史对话" onClick={() => setSidebarOpen(true)}>☰</button>
           <div className="topbar-context">
             <div className="deck-title">{headerTitle}</div>
             <div className="topbar-caption">{step === 'outline' ? '输入主题，整理成可编辑的大纲' : step === 'theme' ? '选择视觉风格，生成整套幻灯片' : '预览、修改并导出演示文稿'}</div>
@@ -557,7 +608,7 @@ export default function App() {
                 onDragLeave={(e) => e.currentTarget.classList.remove('drag')}
                 onDrop={(e) => { e.preventDefault(); e.currentTarget.classList.remove('drag'); uploadFiles(e.dataTransfer.files); }}
               >
-                {!hasDoc ? (
+                {!hasDoc && taskMessages.length === 0 ? (
                   <div className="chat-welcome">
                     <span className="welcome-mark">卷</span>
                     <p className="welcome-kicker">卷王PPT 助手</p>
@@ -570,13 +621,17 @@ export default function App() {
                   </div>
                 ) : (
                   <div className="chat-message-list">
-                    <div className="chat-turn user-turn">
-                      <span className="chat-avatar user-avatar">你</span>
-                      <div className="user-bubble">
-                        <span className="message-label">演示主题</span>
-                        <p>{doc.title || topic || '未命名演示文稿'}</p>
-                      </div>
-                    </div>
+                    {(taskMessages.length ? taskMessages : [{ role: 'user', content: doc.title || topic || '未命名演示文稿' }])
+                      .filter((message) => message.role === 'user')
+                      .map((message, index) => (
+                        <div className="chat-turn user-turn" key={`${message.createdAt || 'legacy'}-${index}`}>
+                          <span className="chat-avatar user-avatar">你</span>
+                          <div className="user-bubble">
+                            <span className="message-label">{index === 0 ? '演示主题' : '补充要求'}</span>
+                            <p>{message.content}</p>
+                          </div>
+                        </div>
+                      ))}
                     <div className="chat-turn assistant-turn">
                       <span className="chat-avatar assistant-avatar">卷</span>
                       <div className="assistant-message">
@@ -719,8 +774,15 @@ export default function App() {
             {!hasSlides ? (
               <div className="empty">
                 <div className="empty-art">🎞️</div>
-                <div className="empty-title">{busy ? '正在按模板逐页生成…' : '还没有幻灯片'}</div>
-                <div className="empty-sub">{busy ? '页面会逐张实时出现；生成后点击文字即可就地编辑' : '回到「选择模板」步，挑一套风格开始生成'}</div>
+                <div className="empty-title">
+                  {busy ? `正在生成幻灯片 ${currentGenerationJob ? `${currentGenerationJob.completed} / ${currentGenerationJob.total}` : ''}` : currentGenerationJob && ['failed', 'interrupted'].includes(currentGenerationJob.status) ? '生成未完成' : '还没有幻灯片'}
+                </div>
+                <div className="empty-sub">
+                  {busy ? `${currentGenerationJob?.message || '正在准备页面'}。关闭或刷新页面不会中断服务端任务。` : currentGenerationJob && ['failed', 'interrupted'].includes(currentGenerationJob.status) ? currentGenerationJob.error : '回到「选择模板」步，挑一套风格开始生成'}
+                </div>
+                {!busy && currentGenerationJob && ['failed', 'interrupted'].includes(currentGenerationJob.status) ? (
+                  <button className="btn btn-primary" onClick={() => setStep('theme')}>返回模板重试</button>
+                ) : null}
               </div>
             ) : (
               <>
@@ -728,9 +790,13 @@ export default function App() {
                   <div className="stage-bar-left">
                     <span className="stage-page-no">{activeIndex + 1} / {slides.length}</span>
                     <span className="stage-page-role">{ROLE_LABEL[slides[activeIndex] && slides[activeIndex].role] || ''}</span>
-                    {busy ? <span className="stage-gen">正在生成…</span> : null}
+                    {busy && currentGenerationJob ? <span className="stage-gen" title={currentGenerationJob.message}>{currentGenerationJob.message || `生成中 ${currentGenerationJob.completed} / ${currentGenerationJob.total}`}</span> : null}
+                    {!busy && currentGenerationJob && ['failed', 'interrupted'].includes(currentGenerationJob.status) ? <span className="stage-gen failed" title={currentGenerationJob.error}>生成未完成</span> : null}
                   </div>
                   <div className="stage-bar-right">
+                    {!busy && currentGenerationJob && ['failed', 'interrupted'].includes(currentGenerationJob.status) && activeThemeId ? (
+                      <button className="btn btn-primary btn-sm" onClick={() => onConfirmTheme(activeThemeId)}>重试整册</button>
+                    ) : null}
                     <button className="btn btn-ghost" disabled={activeIndex <= 0} onClick={() => setActiveIndex((i) => Math.max(0, i - 1))}>← 上一页</button>
                     <button className="btn btn-ghost" disabled={activeIndex >= slides.length - 1} onClick={() => setActiveIndex((i) => Math.min(slides.length - 1, i + 1))}>下一页 →</button>
                   </div>
